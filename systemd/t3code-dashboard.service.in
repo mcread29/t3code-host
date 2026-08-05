@@ -6,12 +6,22 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HOME=@HOME@
-Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=@NODE_DIR@:@HOME@/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Environment=T3CODE_BIN=@T3_BIN@
+Environment=T3CODE_HOME=@T3_HOME@
 Environment=NPM_BIN=@NPM_BIN@
+Environment=NPM_PREFIX=@NPM_PREFIX@
+Environment=PNPM_BIN=@PNPM_BIN@
 Environment=T3CODE_CHANNEL=@CHANNEL@
-Environment=T3CODE_DASH_PORT=4124
-ExecStart=@NODE_BIN@ @HOME@/.local/share/t3code-host/t3code-dashboard.mjs
+Environment=T3CODE_DASH_PORT=@DASH_PORT@
+Environment=T3CODE_PAIR_PORT=@PAIR_PORT@
+Environment=T3CODE_UNIT=@SERVICE_UNIT@
+Environment=T3CODE_STATE_DIR=@STATE_DIR@
+Environment=T3CODE_REPO=@REPO@
+Environment=T3CODE_DEV_REPO=@DEV_REPO@
+Environment=T3CODE_BRANCH=@BRANCH@
+Environment=T3CODE_DEV_BRANCH=@DEV_BRANCH@
+ExecStart=@NODE_BIN@ @APP_DIR@/t3code-dashboard.mjs
 Restart=always
 RestartSec=5
 

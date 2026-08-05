@@ -8,12 +8,13 @@ Type=simple
 Environment=HOME=@HOME@
 Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
 Environment=T3CODE_BIN=@T3_BIN@
-Environment=T3CODE_PORT=4123
-ExecStart=@HOME@/.local/bin/t3code-serve-tailnet
+Environment=T3CODE_HOME=@T3_HOME@
+Environment=T3CODE_PORT=@PORT@
+ExecStart=@SERVE_BIN@
 Restart=always
 RestartSec=5
-StandardOutput=append:@HOME@/.local/state/t3code-host/t3code.log
-StandardError=append:@HOME@/.local/state/t3code-host/t3code.log
+StandardOutput=append:@STATE_DIR@/t3code.log
+StandardError=append:@STATE_DIR@/t3code.log
 
 [Install]
 WantedBy=default.target

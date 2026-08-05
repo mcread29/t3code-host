@@ -1,0 +1,19 @@
+[Unit]
+Description=T3 Code web console (Tailnet-bound)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=@HOME@
+Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
+Environment=T3CODE_BIN=@T3_BIN@
+Environment=T3CODE_PORT=4123
+ExecStart=@HOME@/.local/bin/t3code-serve-tailnet
+Restart=always
+RestartSec=5
+StandardOutput=append:@HOME@/.local/state/t3code-host/t3code.log
+StandardError=append:@HOME@/.local/state/t3code-host/t3code.log
+
+[Install]
+WantedBy=default.target

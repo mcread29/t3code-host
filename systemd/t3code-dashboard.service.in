@@ -1,0 +1,19 @@
+[Unit]
+Description=T3 Code service dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=@HOME@
+Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
+Environment=T3CODE_BIN=@T3_BIN@
+Environment=NPM_BIN=@NPM_BIN@
+Environment=T3CODE_CHANNEL=@CHANNEL@
+Environment=T3CODE_DASH_PORT=4124
+ExecStart=@NODE_BIN@ @HOME@/.local/share/t3code-host/t3code-dashboard.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

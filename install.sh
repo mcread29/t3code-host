@@ -2,11 +2,16 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/guard.sh
+. "$root/lib/guard.sh"
+
 instance="${T3CODE_INSTANCE:-production}"
 if [[ ! "$instance" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
   echo "T3CODE_INSTANCE must contain only lowercase letters, numbers, and hyphens." >&2
   exit 1
 fi
+
+guard_instance "$instance" "install over"
 
 if [ "$instance" = production ]; then
   instance_suffix=""
@@ -17,7 +22,7 @@ else
   instance_suffix="-$instance"
   service_port="${T3CODE_TEST_PORT:-5123}"
   dashboard_port="${T3CODE_TEST_DASH_PORT:-5124}"
-  pair_port="${T3CODE_TEST_PAIR_PORT:-8443}"
+  pair_port="${T3CODE_TEST_PAIR_PORT:-8446}"
 fi
 
 app_name="t3code-host$instance_suffix"
@@ -60,6 +65,33 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "Note: cargo not found — the resource monitor will be skipped."
 fi
 
+# Prints "<site url>\t<proxy target>" for the given HTTPS port, or nothing.
+# `tailscale serve status` omits the port when it is 443, so match both forms.
+serve_site() {
+  tailscale serve status 2>/dev/null |
+    awk -v port=":$1" -v bare="$([ "$1" = 443 ] && echo 1 || echo 0)" '
+      /^https:\/\// { site = $1; want = (site ~ port) || (bare && site !~ /:[0-9]+$/); next }
+      want && /proxy/ { print site "\t" $NF; exit }
+    '
+}
+
+# Tailscale Serve ports are shared across everything on this machine, so a
+# collision would quietly steal someone else's endpoint. Say so now rather than
+# after a multi-minute build.
+serve_owner="$(serve_site "$pair_port" | cut -f2)"
+case "${serve_owner:-}" in
+  '' | *":$dashboard_port" | *":$service_port") ;;
+  *)
+    echo "Tailscale Serve port $pair_port is already proxying to $serve_owner." >&2
+    if [ "$instance" = production ]; then
+      echo "Free it first: tailscale serve --https=$pair_port off" >&2
+    else
+      echo "Pick another with T3CODE_TEST_PAIR_PORT, or free it: tailscale serve --https=$pair_port off" >&2
+    fi
+    exit 1
+    ;;
+esac
+
 node_bin="$(command -v node)"
 npm_bin="${T3CODE_NPM_BIN:-$(command -v npm)}"
 # Vite+'s npm shim can create links in its shared bin directory after a global
@@ -75,17 +107,35 @@ fi
 pnpm_bin="$(command -v pnpm)"
 node_dir="$(dirname "$node_bin")"
 
-# Bootstrap from npm first so a working t3 exists even if the source build
-# fails below. The source build then installs over it.
-echo "Installing t3@$channel as a fallback..."
 npm_install_args=(install --global)
 if [ -n "$npm_prefix" ]; then
   npm_install_args+=(--prefix "$npm_prefix")
 fi
+
+# A dashboard-only change does not need the multi-minute source build, so
+# T3CODE_SKIP_BUILD refreshes just the dashboard, launcher, units, and Serve
+# mapping. The running T3 build is left exactly as it is.
+skip_build="${T3CODE_SKIP_BUILD:-0}"
+
+if [ "$skip_build" = 1 ]; then
+  echo "Skipping the source build (T3CODE_SKIP_BUILD=1); refreshing the dashboard only."
+else
+
+# The npm fallback and the git preparation only matter on a first install. A
+# rebuild loop skips them and goes straight to building the worktree as it is.
+if [ "${T3CODE_SKIP_BOOTSTRAP:-0}" = 1 ]; then
+  echo "Rebuilding $repo_dir as-is (T3CODE_SKIP_BOOTSTRAP=1)."
+else
+
+# Bootstrap from npm first so a working t3 exists even if the source build
+# fails below. The source build then installs over it.
+echo "Installing t3@$channel as a fallback..."
 CI=1 "$npm_bin" "${npm_install_args[@]}" "t3@$channel"
 
 echo "Preparing the fork checkout at $repo_dir..."
-if [ ! -d "$repo_dir/.git" ]; then
+# -e, not -d: a linked worktree's .git is a file. This lets an instance be
+# pointed at an existing worktree (T3CODE_REPO=.../dev) instead of a new clone.
+if [ ! -e "$repo_dir/.git" ]; then
   git clone "$fork_url" "$repo_dir"
 fi
 if ! git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; then
@@ -104,28 +154,40 @@ if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch"; then
 fi
 git -C "$repo_dir" checkout "$branch"
 
+# A production install builds a pristine deploy worktree, so uncommitted work
+# there is a mistake. An instance pointed at a development worktree is expected
+# to be dirty -- building exactly what you are editing is the whole point.
 if [ -n "$(git -C "$repo_dir" status --porcelain)" ]; then
-  echo "Deployment worktree is not clean: $repo_dir" >&2
-  echo "Move active development to $dev_dir before installation." >&2
-  exit 1
+  if [ "${T3CODE_ALLOW_DIRTY:-0}" != 1 ]; then
+    echo "Deployment worktree is not clean: $repo_dir" >&2
+    echo "Move active development to $dev_dir, or set T3CODE_ALLOW_DIRTY=1 to build it as-is." >&2
+    exit 1
+  fi
+  echo "Note: $repo_dir has uncommitted changes; building them as-is."
 fi
 
 # Active development has its own branch and worktree. This keeps generated or
 # uncommitted development files out of the dashboard-managed deploy worktree.
-if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$dev_branch"; then
-  if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$dev_branch"; then
-    git -C "$repo_dir" branch "$dev_branch" "origin/$dev_branch"
-  else
-    git -C "$repo_dir" branch "$dev_branch" "$branch"
+# When the two are the same path the instance already builds development
+# directly, and there is no second worktree to create.
+if [ "$dev_dir" != "$repo_dir" ]; then
+  if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$dev_branch"; then
+    if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$dev_branch"; then
+      git -C "$repo_dir" branch "$dev_branch" "origin/$dev_branch"
+    else
+      git -C "$repo_dir" branch "$dev_branch" "$branch"
+    fi
+  fi
+  if [ ! -e "$dev_dir/.git" ]; then
+    if [ -e "$dev_dir" ]; then
+      echo "Development worktree path exists but is not a Git worktree: $dev_dir" >&2
+      exit 1
+    fi
+    git -C "$repo_dir" worktree add "$dev_dir" "$dev_branch"
   fi
 fi
-if [ ! -e "$dev_dir/.git" ]; then
-  if [ -e "$dev_dir" ]; then
-    echo "Development worktree path exists but is not a Git worktree: $dev_dir" >&2
-    exit 1
-  fi
-  git -C "$repo_dir" worktree add "$dev_dir" "$dev_branch"
-fi
+
+fi # skip_bootstrap
 
 echo "Building T3 Code from $branch..."
 build_ok=1
@@ -154,6 +216,8 @@ else
   echo "Source build failed. Keeping the npm install; use the dashboard to retry." >&2
 fi
 
+fi # skip_build
+
 if [ -n "$npm_prefix" ]; then
   t3_bin="$npm_prefix/bin/t3"
 else
@@ -169,7 +233,16 @@ fi
 
 install -d "$bin_dir" "$app_dir" "$state_dir" "$unit_dir" "$t3_home"
 install -m 0755 "$root/src/t3code-serve-tailnet" "$bin_dir/$serve_name"
-install -m 0644 "$root/src/t3code-dashboard.mjs" "$app_dir/t3code-dashboard.mjs"
+
+# Linking instead of copying lets an instance pick up dashboard edits from this
+# checkout on a plain `systemctl --user restart`, with no reinstall.
+if [ "${T3CODE_LINK_DASHBOARD:-0}" = 1 ]; then
+  ln -sfn "$root/src/t3code-dashboard.mjs" "$app_dir/t3code-dashboard.mjs"
+  echo "Dashboard linked to $root/src/t3code-dashboard.mjs (edits apply on restart)."
+else
+  rm -f "$app_dir/t3code-dashboard.mjs"
+  install -m 0644 "$root/src/t3code-dashboard.mjs" "$app_dir/t3code-dashboard.mjs"
+fi
 
 sed \
   -e "s|@HOME@|$HOME|g" \
@@ -203,35 +276,42 @@ sed \
 
 systemctl --user daemon-reload
 systemctl --user enable "$service_unit" "$dashboard_unit"
-systemctl --user restart "$service_unit" "$dashboard_unit"
+
+# A dashboard-only refresh leaves T3 Code running. Restarting it would drop
+# every connected client and interrupt whatever is running inside it, for a
+# change that cannot affect it.
+if [ "$skip_build" = 1 ]; then
+  systemctl --user restart "$dashboard_unit"
+else
+  systemctl --user restart "$service_unit" "$dashboard_unit"
+fi
 
 host="$(tailscale ip -4 | head -n1)"
 
-# Pairing owns the Tailscale Serve mapping and refuses to replace an unrelated
-# target. The service can take a few seconds to write its runtime state, so
-# retry before treating publication as failed. The one-second link is discarded;
-# this step only establishes the persistent HTTPS proxy.
-serve_ready=0
-for _ in {1..20}; do
-  if T3CODE_HOME="$t3_home" "$t3_bin" pair \
-    --tailscale \
-    --ttl 1s \
-    --label "$instance installer exposure check" \
-    --tailscale-serve-port "$pair_port" \
-    >/dev/null 2>&1; then
-    serve_ready=1
-    break
-  fi
-  sleep 1
-done
-
-if [ "$serve_ready" != 1 ]; then
-  echo "T3 Code is running, but Tailscale Serve could not publish HTTPS port $pair_port." >&2
+# Serve publishes the dashboard rather than T3. The dashboard proxies T3 at "/"
+# on the same origin, so one HTTPS endpoint covers both, the embedded console
+# shares the dashboard's session cookie, and pairing links can be minted
+# locally instead of letting `t3 pair --tailscale` own this mapping.
+#
+# Every Serve port shares one MagicDNS hostname, and cookies ignore ports. A
+# second instance published there would overwrite production's session cookie
+# and silently downgrade that browser's scopes, so an instance can opt out and
+# stay on its tailnet address.
+if [ "${T3CODE_SKIP_SERVE:-0}" = 1 ]; then
+  echo "Skipping the Tailscale Serve mapping (T3CODE_SKIP_SERVE=1)."
+elif ! tailscale serve --bg --https="$pair_port" "http://${host}:${dashboard_port}" >/dev/null; then
+  echo "Tailscale Serve could not publish HTTPS port $pair_port." >&2
   echo "Check: tailscale serve status" >&2
   exit 1
 fi
 
-echo "T3 Code ($instance):   http://${host}:${service_port}"
-echo "Dashboard ($instance): http://${host}:${dashboard_port}"
-echo "Tailscale Serve:        HTTPS port ${pair_port}"
+serve_url="$(serve_site "$pair_port" | cut -f1)"
+
+if [ -n "$serve_url" ]; then
+  echo "Dashboard ($instance): $serve_url"
+  echo "  also on the tailnet address: http://${host}:${dashboard_port}"
+else
+  echo "Dashboard ($instance): http://${host}:${dashboard_port}"
+fi
+echo "T3 Code ($instance):   http://${host}:${service_port} (embedded in the dashboard)"
 echo "Use the dashboard to create pairing links and manage updates."

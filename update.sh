@@ -2,11 +2,16 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/guard.sh
+. "$root/lib/guard.sh"
+
 instance="${T3CODE_INSTANCE:-production}"
 if [[ ! "$instance" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
   echo "T3CODE_INSTANCE must contain only lowercase letters, numbers, and hyphens." >&2
   exit 1
 fi
+
+guard_instance "$instance" "update"
 
 if [ "$instance" = production ]; then
   app_name="t3code-host"

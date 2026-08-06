@@ -2,5 +2,20 @@
 set -euo pipefail
 
 port="${T3CODE_PORT:-4123}"
-host="$(tailscale ip -4 | head -n1)"
+
+# After a reboot this can run before tailscaled has an address. Serving on an
+# empty --host would bind the wrong interface, so wait for a real one and let
+# systemd retry the unit if it never appears.
+host=""
+for _ in $(seq 30); do
+  host="$(tailscale ip -4 2>/dev/null | head -n1)"
+  [ -n "$host" ] && break
+  sleep 2
+done
+
+if [ -z "$host" ]; then
+  echo "no Tailscale IPv4 address after 60s; exiting so systemd retries" >&2
+  exit 1
+fi
+
 exec "${T3CODE_BIN:-t3}" serve --mode web --host "$host" --port "$port"

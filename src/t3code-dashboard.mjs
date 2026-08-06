@@ -2,7 +2,7 @@
 // Small status/control dashboard for the t3code service.
 // Binds to the tailnet address, same trust boundary as t3code itself.
 
-import { createServer } from 'node:http'
+import { createServer, request as httpRequest } from 'node:http'
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -11,8 +11,16 @@ import { promisify } from 'node:util'
 const run = promisify(execFile)
 
 const PORT = Number(process.env.T3CODE_DASH_PORT ?? 4124)
-const PAIR_PORT = Number(process.env.T3CODE_PAIR_PORT ?? 443)
+// An empty unit means this instance is not run by systemd -- the no-install
+// dev mode, where the fork's own dev runner owns the process. Service control
+// and the build jobs do not apply there.
 const UNIT = process.env.T3CODE_UNIT ?? 't3code.service'
+const MANAGED = UNIT !== ''
+
+// Points the proxy at a running dev server instead of the installed build's
+// runtime file. In the fork's dev mode the browser origin is the web dev
+// server, which proxies the backend itself.
+const PROXY_ORIGIN = process.env.T3CODE_PROXY_ORIGIN ?? ''
 const T3_BIN = process.env.T3CODE_BIN ?? 't3'
 const NPM_BIN = process.env.NPM_BIN ?? 'npm'
 const NPM_PREFIX = process.env.NPM_PREFIX ?? ''
@@ -33,13 +41,29 @@ const T3_HOME = process.env.T3CODE_HOME ?? `${process.env.HOME}/.t3`
 // stops a random page in your browser from POSTing to us.
 const TOKEN = randomBytes(16).toString('hex')
 
-async function tailnetHost() {
-  try {
-    const { stdout } = await run('/usr/bin/tailscale', ['ip', '-4'])
-    return stdout.trim().split('\n')[0]
-  } catch {
-    return '127.0.0.1'
+// On a reboot this can start before tailscaled has an address. Binding the
+// loopback fallback then leaves the dashboard unreachable on the tailnet until
+// someone notices, so wait for a real address and let systemd retry the unit
+// rather than come up on the wrong one.
+async function tailnetHost({ attempts = 30, delayMs = 2000 } = {}) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const { stdout } = await run('/usr/bin/tailscale', ['ip', '-4'])
+      const address = stdout.trim().split('\n')[0]
+      if (address) return address
+    } catch {
+      // tailscaled not up yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
   }
+  return null
+}
+
+// Needed before the first request to recognise our own Tailscale Serve mapping.
+const HOST = await tailnetHost()
+if (!HOST) {
+  console.error('no Tailscale IPv4 address after 60s; exiting so systemd retries')
+  process.exit(1)
 }
 
 async function systemctl(...args) {
@@ -296,13 +320,45 @@ async function serviceDetail() {
   )
 }
 
+// Without systemd there is no unit to interrogate, so liveness is simply
+// whether the dev server answers.
+async function reachable(origin) {
+  if (!origin) return false
+  try {
+    const response = await fetch(origin, { signal: AbortSignal.timeout(5000) })
+    return response.status > 0
+  } catch {
+    return false
+  }
+}
+
 async function status() {
-  const [detail, installed, url] = await Promise.all([
-    serviceDetail(),
+  const [detail, installed, url, origin] = await Promise.all([
+    MANAGED ? serviceDetail() : {},
     installedVersion(),
     publishedUrl(),
+    t3Origin(),
   ])
+
+  if (!MANAGED) {
+    const up = await reachable(origin)
+    return {
+      managed: false,
+      unit: 'dev server',
+      active: up ? 'active' : 'inactive',
+      sub: up ? 'running' : 'not answering',
+      enabled: 'not managed',
+      pid: null,
+      startedAt: null,
+      restarts: '0',
+      installed,
+      url,
+      origin,
+    }
+  }
+
   return {
+    managed: true,
     unit: UNIT,
     active: detail.ActiveState ?? 'unknown',
     sub: detail.SubState ?? '',
@@ -312,21 +368,23 @@ async function status() {
     restarts: detail.NRestarts ?? '0',
     installed,
     url,
+    origin,
   }
 }
 
+// Tailscale Serve publishes the dashboard, not T3 directly: T3 is reached
+// through the proxy below, so one HTTPS origin covers both and the embedded
+// console shares the dashboard's session cookie.
 async function publishedUrl() {
   try {
-    const runtime = JSON.parse(
-      await readFile(`${T3_HOME}/userdata/server-runtime.json`, 'utf8'),
-    )
     const { stdout } = await run('/usr/bin/tailscale', ['serve', 'status', '--json'], {
       timeout: 10_000,
       maxBuffer: 8 * 1024 * 1024,
     })
     const serve = JSON.parse(stdout)
+    const self = `http://${HOST}:${PORT}`
     const match = Object.entries(serve.Web ?? {}).find(([, site]) =>
-      Object.values(site.Handlers ?? {}).some((handler) => handler.Proxy === runtime.origin),
+      Object.values(site.Handlers ?? {}).some((handler) => handler.Proxy === self),
     )
     return match ? `https://${match[0]}` : null
   } catch {
@@ -334,12 +392,211 @@ async function publishedUrl() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// T3 proxy
+// ---------------------------------------------------------------------------
+
+// T3 is proxied under the dashboard's own origin so the embedded console is
+// same-origin: its session cookie is first-party (no third-party cookie
+// partitioning), and the page can read a 401 from /ws to tell whether this
+// browser is paired.
+//
+// T3's client is built with BASE_URL "/", so its router only resolves when the
+// document is at the root -- it cannot be moved to /t3code. Both therefore
+// answer on "/", split by who is asking: a top-level navigation gets the
+// dashboard, an embedded one gets T3. Sec-Fetch-Dest carries that, and the
+// explicit ?embed=1 the iframe uses covers browsers that omit the header and
+// doubles as a way to open the bare console in its own tab.
+const DASH_PATH = '/dashboard'
+const API_PREFIX = '/_dash/'
+const EMBED_PARAM = 'embed'
+
+// Only a top-level document navigation gets the dashboard; everything else at
+// "/" is T3's. Defaulting the other way would hand the dashboard's HTML to
+// every non-browser client -- the native and headless ones authenticate with a
+// bearer token and send no fetch metadata at all, so they must not have to
+// opt in to reaching the backend they were pointed at.
+function wantsDashboard(req, url) {
+  if (url.searchParams.get(EMBED_PARAM) === '1') return false
+  return req.headers['sec-fetch-dest'] === 'document'
+}
+
+// The origin changes whenever T3 restarts on a different port, so re-read it
+// rather than caching for the life of the process.
+let originCache = { value: null, at: 0 }
+async function t3Origin() {
+  if (PROXY_ORIGIN) return PROXY_ORIGIN
+  if (Date.now() - originCache.at < 5000) return originCache.value
+  let value = null
+  try {
+    const runtime = JSON.parse(await readFile(`${T3_HOME}/userdata/server-runtime.json`, 'utf8'))
+    value = runtime.origin ?? null
+  } catch {
+    value = null
+  }
+  originCache = { value, at: Date.now() }
+  return value
+}
+
+// Per RFC 9110 these describe a single hop and must not be forwarded.
+const HOP_BY_HOP = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade',
+])
+
+// A pairing link is capped at five scopes, so a paired browser cannot manage
+// clients or mint links -- the two things the console's Connections screen is
+// for. `t3 auth session issue` mints all eight without restarting anything, so
+// the proxy carries one and presents it on every request.
+//
+// This makes tailnet access to the dashboard the gate, in place of per-browser
+// pairing. That is the boundary the dashboard already sits behind: it can
+// already start, stop, and rebuild the service. Reaching T3 directly, outside
+// this proxy, still requires pairing as before.
+const SESSION_FILE = `${STATE_DIR}/proxy-session`
+let sessionToken = null
+
+async function mintSessionToken() {
+  const args = ['auth', 'session', 'issue', '--ttl', '30d', '--label', 'dashboard proxy', '--token-only']
+  if (T3_HOME) args.push('--base-dir', T3_HOME)
+  const { stdout } = await run(T3_BIN, args, { timeout: 30_000 })
+  const token = stripAnsi(stdout).trim().split('\n').filter(Boolean).pop()?.trim()
+  if (!token) throw new Error('t3 issued no token')
+  await mkdir(STATE_DIR, { recursive: true }).catch(() => {})
+  await writeFile(SESSION_FILE, token, { mode: 0o600 }).catch(() => {})
+  return token
+}
+
+// 401 means the stored token was revoked or outlived its TTL.
+async function tokenWorks(token, origin) {
+  try {
+    const response = await fetch(new URL('/ws', origin), {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    })
+    return response.status !== 401
+  } catch {
+    return false
+  }
+}
+
+async function proxySession(origin) {
+  if (sessionToken) return sessionToken
+  const stored = await readFile(SESSION_FILE, 'utf8').catch(() => null)
+  if (stored?.trim() && (await tokenWorks(stored.trim(), origin))) {
+    sessionToken = stored.trim()
+    return sessionToken
+  }
+  try {
+    sessionToken = await mintSessionToken()
+  } catch {
+    // Without a token the console still works, just with whatever the browser
+    // paired for itself. Better than refusing to proxy at all.
+    sessionToken = null
+  }
+  return sessionToken
+}
+
+function forwardHeaders(headers, target, token) {
+  const out = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (!HOP_BY_HOP.has(key.toLowerCase())) out[key] = value
+  }
+  // T3 sees its own host, so any absolute URL it builds stays self-consistent.
+  out.host = target.host
+  if (token) {
+    out.authorization = `Bearer ${token}`
+    // Drop any session cookie the browser paired for itself, so the scopes in
+    // the console are always the token's rather than whichever arrived first.
+    const cookie = (headers.cookie ?? '')
+      .split(';')
+      .map((part) => part.trim())
+      .filter((part) => part && !/^t3_session=/.test(part))
+      .join('; ')
+    if (cookie) out.cookie = cookie
+    else delete out.cookie
+  }
+  return out
+}
+
+async function proxy(req, res) {
+  const origin = await t3Origin()
+  if (!origin) {
+    return json(res, 503, { error: 'T3 Code is not running, so there is nothing to proxy.' })
+  }
+  const token = await proxySession(origin)
+  const target = new URL(req.url, origin)
+  const upstream = httpRequest(
+    { protocol: target.protocol, hostname: target.hostname, port: target.port,
+      method: req.method, path: target.pathname + target.search,
+      headers: forwardHeaders(req.headers, target, token) },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers)
+      upstreamRes.pipe(res)
+    },
+  )
+  upstream.on('error', (err) => {
+    if (!res.headersSent) json(res, 502, { error: `proxy to T3 failed: ${err.message}` })
+    else res.destroy()
+  })
+  req.pipe(upstream)
+}
+
+// The console is a WebSocket client, so the upgrade has to be proxied too;
+// without this the app loads and then hangs retrying its connection.
+async function proxyUpgrade(req, clientSocket, head) {
+  const origin = await t3Origin()
+  if (!origin) return clientSocket.destroy()
+
+  const token = await proxySession(origin)
+  const target = new URL(req.url, origin)
+  const upstream = httpRequest({
+    protocol: target.protocol, hostname: target.hostname, port: target.port,
+    method: req.method, path: target.pathname + target.search,
+    headers: {
+      ...forwardHeaders(req.headers, target, token),
+      connection: 'Upgrade',
+      upgrade: req.headers.upgrade,
+    },
+  })
+
+  upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    const lines = Object.entries(upstreamRes.headers).map(([k, v]) => k + ': ' + v)
+    clientSocket.write(
+      `HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${lines.join('\r\n')}\r\n\r\n`,
+    )
+    if (upstreamHead?.length) clientSocket.unshift(upstreamHead)
+    upstreamSocket.on('error', () => clientSocket.destroy())
+    clientSocket.on('error', () => upstreamSocket.destroy())
+    upstreamSocket.pipe(clientSocket).pipe(upstreamSocket)
+  })
+  // A refused upgrade (401 when unpaired) arrives as a normal response.
+  upstream.on('response', (upstreamRes) => {
+    clientSocket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n\r\n`)
+    clientSocket.destroy()
+  })
+  upstream.on('error', () => clientSocket.destroy())
+
+  if (head?.length) upstream.write(head)
+  upstream.end()
+}
+
 function stripAnsi(value) {
   return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
 }
 
-async function createPairingLink({ label, ttl, port }) {
-  const args = ['pair', '--tailscale', '--ttl', ttl, '--tailscale-serve-port', String(port)]
+// Tokens live in the URL fragment and are origin-independent, so a link minted
+// against T3's local origin can be re-pointed at whichever origin the client
+// should actually use. Minting locally also keeps `t3 pair --tailscale` from
+// repointing the Serve mapping at T3 and cutting the dashboard off.
+async function rebase(pairingUrl, base) {
+  const target = new URL('/pair', base ?? (await publishedUrl()) ?? `http://${HOST}:${PORT}`)
+  target.hash = new URL(pairingUrl).hash
+  return target.toString()
+}
+
+async function createPairingLink({ label, ttl }) {
+  const args = ['pair', '--ttl', ttl]
   if (label) args.push('--label', label)
   const { stdout } = await run(T3_BIN, args, {
     timeout: 60_000,
@@ -349,16 +606,12 @@ async function createPairingLink({ label, ttl, port }) {
   const pairingUrl = /^Pairing URL:\s*(\S+)/m.exec(output)?.[1]
   const expires = /^Expires:\s*(.+)$/m.exec(output)?.[1]?.trim() ?? null
   if (!pairingUrl) throw new Error('T3 created a link but did not return a pairing URL.')
-  return { pairingUrl, expires }
+  return { pairingUrl: await rebase(pairingUrl), expires }
 }
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
-async function createAdministrativePairingLink({ port }) {
-  // Ensure the requested public endpoint exists. This creates a one-second
-  // standard link which expires before the administrative link is displayed.
-  await createPairingLink({ label: 'dashboard exposure check', ttl: '1s', port })
-
+async function createAdministrativePairingLink() {
   const logPath = `${STATE_DIR}/t3code.log`
   const before = await readFile(logPath).catch(() => Buffer.alloc(0))
   await run('systemctl', ['--user', 'restart', UNIT], { timeout: 30_000 })
@@ -370,11 +623,7 @@ async function createAdministrativePairingLink({ port }) {
     const appended = current.subarray(offset).toString('utf8')
     const localPairingUrl = /^Pairing URL:\s*(\S+)/m.exec(stripAnsi(appended))?.[1]
     if (localPairingUrl) {
-      const publicBase = await publishedUrl()
-      if (!publicBase) throw new Error('T3 restarted, but its Tailscale Serve URL was not found.')
-      const publicUrl = new URL('/pair', publicBase)
-      publicUrl.hash = new URL(localPairingUrl).hash
-      return { pairingUrl: publicUrl.toString(), expires: 'approximately 5 minutes' }
+      return { pairingUrl: await rebase(localPairingUrl), expires: 'approximately 5 minutes' }
     }
     await sleep(250)
   }
@@ -608,8 +857,15 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
 
   try {
-    if (req.method === 'GET' && url.pathname === '/') {
-      const html = PAGE.replace('__TOKEN__', TOKEN).replace('__PAIR_PORT__', String(PAIR_PORT))
+    // An explicit dashboard URL that does not depend on fetch metadata, for
+    // bookmarks and for browsers too old to send it.
+    const dashboardPath = url.pathname === DASH_PATH || url.pathname === DASH_PATH + '/'
+
+    if (dashboardPath || (url.pathname === '/' && wantsDashboard(req, url))) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return json(res, 405, { error: 'method not allowed' })
+      }
+      const html = PAGE.replaceAll('__TOKEN__', TOKEN)
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
@@ -617,35 +873,33 @@ const server = createServer(async (req, res) => {
       return res.end(html)
     }
 
-    if (req.method === 'GET' && url.pathname === '/favicon.ico') {
-      res.writeHead(204).end()
-      return
-    }
+    // Anything that is not the dashboard page or its API belongs to T3.
+    if (!url.pathname.startsWith(API_PREFIX)) return proxy(req, res)
 
-    if (req.method === 'GET' && url.pathname === '/api/status') {
+    if (req.method === 'GET' && url.pathname === '/_dash/status') {
       return json(res, 200, await status())
     }
 
-    if (req.method === 'GET' && url.pathname === '/api/latest') {
+    if (req.method === 'GET' && url.pathname === '/_dash/latest') {
       const [latest, installed] = await Promise.all([latestVersion(), installedVersion()])
       return json(res, 200, { latest, installed, upToDate: isUpToDate(installed, latest) })
     }
 
-    if (req.method === 'GET' && url.pathname === '/api/changelog') {
+    if (req.method === 'GET' && url.pathname === '/_dash/changelog') {
       const [installed, latest] = await Promise.all([installedVersion(), latestVersion()])
       const from = url.searchParams.get('from') ?? installed
       const to = url.searchParams.get('to') ?? latest
       return json(res, 200, { from, to, releases: await changelog(from, to) })
     }
 
-    if (req.method === 'GET' && url.pathname === '/api/fork') {
+    if (req.method === 'GET' && url.pathname === '/_dash/fork') {
       const fork = await forkStatus()
       if (!fork) return json(res, 404, { error: 'source mode is not configured' })
       const active = activeJob && jobs.get(activeJob)?.state === 'running' ? activeJob : null
       return json(res, 200, { ...fork, commits: await incomingCommits(), active })
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/job') {
+    if (req.method === 'POST' && url.pathname === '/_dash/job') {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
       try {
         const job = startJob(url.searchParams.get('name'))
@@ -655,15 +909,18 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    if (req.method === 'GET' && url.pathname.startsWith('/api/job/')) {
-      const job = jobs.get(url.pathname.slice('/api/job/'.length))
+    if (req.method === 'GET' && url.pathname.startsWith('/_dash/job/')) {
+      const job = jobs.get(url.pathname.slice('/_dash/job/'.length))
       if (!job) return json(res, 404, { error: 'no such job' })
       return json(res, 200, job)
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/action') {
+    if (req.method === 'POST' && url.pathname === '/_dash/action') {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
 
+      if (!MANAGED) {
+        return json(res, 409, { error: 'this instance is run by the dev server, not systemd' })
+      }
       const action = url.searchParams.get('name')
       const fn = ACTIONS[action]
       if (!fn) return json(res, 400, { error: `unknown action: ${action}` })
@@ -672,24 +929,20 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: true, action, output: output || '(no output)' })
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/pair') {
+    if (req.method === 'POST' && url.pathname === '/_dash/pair') {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
 
       const label = (url.searchParams.get('label') ?? '').trim()
       const ttl = (url.searchParams.get('ttl') ?? '15m').trim()
-      const port = Number(url.searchParams.get('port') ?? 443)
       if (label.length > 80) return json(res, 400, { error: 'label is too long' })
       if (!/^\d+\s*(?:s|m|h|d|seconds?|minutes?|hours?|days?)$/i.test(ttl)) {
         return json(res, 400, { error: 'invalid TTL; use values such as 15m, 1h, or 2 days' })
       }
-      if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-        return json(res, 400, { error: 'port must be between 1 and 65535' })
-      }
 
       const administrative = url.searchParams.get('administrative') === 'true'
       const result = administrative
-        ? await createAdministrativePairingLink({ port })
-        : await createPairingLink({ label, ttl, port })
+        ? await createAdministrativePairingLink()
+        : await createPairingLink({ label, ttl })
       return json(res, 200, result)
     }
 
@@ -703,108 +956,307 @@ const server = createServer(async (req, res) => {
 // plain template literal would eat before the browser ever sees them.
 const PAGE = String.raw`<!doctype html>
 <meta charset="utf-8">
-<title>t3code service</title>
+<title>t3code</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root { color-scheme: dark; }
-  body { background:#0d0d0d; color:#e8e8e8; font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
-         margin:0; padding:2.5rem 1.5rem; display:flex; justify-content:center; }
-  main { width:100%; max-width:640px; }
-  h1 { font-size:1rem; font-weight:600; letter-spacing:.02em; margin:0 0 1.5rem; }
-  .card { border:1px solid #262626; border-radius:10px; padding:1.1rem 1.25rem; margin-bottom:1rem; }
-  .row { display:flex; justify-content:space-between; gap:1rem; padding:.3rem 0; }
-  .row dt { color:#8a8a8a; }
-  .row dd { margin:0; text-align:right; word-break:break-all; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:.5rem;
-         vertical-align:middle; background:#666; }
-  .ok { background:#22c55e; } .bad { background:#ef4444; } .warn { background:#f59e0b; }
-  .actions { display:flex; flex-wrap:wrap; gap:.5rem; }
-  button { flex:1 1 auto; min-width:110px; background:#1a1a1a; color:#e8e8e8; border:1px solid #333;
-           border-radius:7px; padding:.55rem .9rem; font:inherit; cursor:pointer; }
-  button:hover:not(:disabled) { background:#242424; border-color:#444; }
-  button:disabled { opacity:.45; cursor:default; }
-  button.danger:hover:not(:disabled) { border-color:#ef4444; color:#ef4444; }
-  input { box-sizing:border-box; width:100%; background:#141414; color:#e8e8e8; border:1px solid #333;
-          border-radius:7px; padding:.55rem .7rem; font:inherit; }
-  .fields { display:grid; grid-template-columns:1fr 5rem 5rem; gap:.5rem; margin:.75rem 0; }
-  .pair-result { margin-top:.8rem; padding-top:.8rem; border-top:1px solid #262626; }
-  .pair-result a { overflow-wrap:anywhere; }
-  .muted { color:#7a7a7a; font-size:.78rem; }
-  pre { background:#141414; border:1px solid #232323; border-radius:7px; padding:.8rem;
-        white-space:pre-wrap; word-break:break-all; color:#9a9a9a; margin:1rem 0 0; max-height:15rem;
-        overflow:auto; }
-  a { color:#60a5fa; }
-  #notes { margin-top:1rem; border-top:1px solid #262626; padding-top:.5rem;
-           max-height:22rem; overflow:auto; }
-  .rel { padding:.75rem 0; border-bottom:1px solid #1c1c1c; }
+  :root {
+    color-scheme: dark;
+    --bg:#0a0a0b;
+    --panel:#0f0f11;
+    --raised:#141417;
+    --line:#232327;
+    --line-soft:#1a1a1d;
+    --text:#e9e9ec;
+    --dim:#8b8b93;
+    --faint:#63636b;
+    --accent:#7dd3fc;
+    --green:#34d399;
+    --amber:#fbbf24;
+    --red:#f87171;
+    --violet:#c084fc;
+    --mono: ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sidebar: 400px;
+  }
+  * { box-sizing:border-box; }
+  /* Author display rules below outrank the hidden attribute's UA style, and
+     several of the toggled elements set one. Keep hidden authoritative. */
+  [hidden] { display:none !important; }
+  html, body { height:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:13.5px/1.6 var(--mono);
+    -webkit-font-smoothing:antialiased;
+  }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  ::selection { background:#1e3a4a; }
+
+  /* layout ---------------------------------------------------------------- */
+  .app {
+    display:grid; grid-template-columns:var(--sidebar) minmax(0,1fr);
+    height:100dvh; transition:grid-template-columns .25s ease;
+  }
+  .app.collapsed { grid-template-columns:0 minmax(0,1fr); }
+  .app.collapsed .side { opacity:0; pointer-events:none; }
+
+  .side {
+    min-width:0; overflow-y:auto; overflow-x:hidden;
+    border-right:1px solid var(--line);
+    background:linear-gradient(180deg,#0e0e10,#0a0a0b 240px);
+    display:flex; flex-direction:column;
+    transition:opacity .2s ease;
+    scrollbar-width:thin; scrollbar-color:#2a2a2f transparent;
+  }
+  .side::-webkit-scrollbar { width:9px; }
+  .side::-webkit-scrollbar-thumb { background:#25252a; border-radius:9px; border:2px solid var(--bg); }
+  .side-body { padding:0 1.1rem 1.1rem; display:flex; flex-direction:column; gap:.85rem; flex:1; }
+
+  .stage { min-width:0; display:flex; flex-direction:column; background:#08080a; }
+
+  /* brand ----------------------------------------------------------------- */
+  .brand {
+    position:sticky; top:0; z-index:5;
+    padding:1.1rem 1.1rem .9rem;
+    background:linear-gradient(180deg,#101013 70%,rgba(16,16,19,0));
+    display:flex; align-items:center; gap:.6rem;
+  }
+  .mark {
+    width:26px; height:26px; border-radius:7px; flex:none;
+    background:linear-gradient(140deg,#1e3a4a,#0f1a20);
+    border:1px solid #2b4655; color:var(--accent);
+    display:grid; place-items:center; font-size:.72rem; font-weight:700; letter-spacing:-.02em;
+  }
+  .brand h1 { font-size:.86rem; font-weight:600; letter-spacing:.04em; margin:0; text-transform:uppercase; }
+  .brand .sub { font-size:.68rem; color:var(--faint); letter-spacing:.06em; }
+
+  /* cards ----------------------------------------------------------------- */
+  .card {
+    border:1px solid var(--line); border-radius:12px; background:var(--panel);
+    padding:.9rem 1rem 1rem;
+    box-shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 8px 24px -18px #000;
+  }
+  .card > h2 {
+    font-size:.68rem; font-weight:600; letter-spacing:.11em; text-transform:uppercase;
+    color:var(--faint); margin:0 0 .7rem; display:flex; align-items:center; gap:.5rem;
+  }
+  .card > h2 .tag { margin-left:auto; text-transform:none; letter-spacing:0; color:var(--dim); font-weight:400; }
+
+  .row { display:flex; justify-content:space-between; gap:1rem; padding:.22rem 0; font-size:.8rem; }
+  .row dt { color:var(--dim); white-space:nowrap; }
+  .row dd { margin:0; text-align:right; word-break:break-all; color:#d4d4d8; }
+  dl { margin:0; }
+
+  /* status ---------------------------------------------------------------- */
+  .state {
+    display:flex; align-items:center; gap:.6rem; padding:.15rem 0 .75rem;
+    margin-bottom:.6rem; border-bottom:1px solid var(--line-soft);
+  }
+  .state .label { font-size:.95rem; letter-spacing:.01em; }
+  .state .meta { margin-left:auto; font-size:.72rem; color:var(--faint); }
+  .dot {
+    display:inline-block; width:9px; height:9px; border-radius:50%; flex:none; background:#5a5a62;
+    position:relative;
+  }
+  .dot.ok { background:var(--green); box-shadow:0 0 0 0 rgba(52,211,153,.45); animation:pulse 2.4s infinite; }
+  .dot.bad { background:var(--red); box-shadow:0 0 8px rgba(248,113,113,.6); }
+  .dot.warn { background:var(--amber); }
+  @keyframes pulse {
+    0% { box-shadow:0 0 0 0 rgba(52,211,153,.4); }
+    70% { box-shadow:0 0 0 7px rgba(52,211,153,0); }
+    100% { box-shadow:0 0 0 0 rgba(52,211,153,0); }
+  }
+
+  /* controls -------------------------------------------------------------- */
+  .actions { display:flex; flex-wrap:wrap; gap:.45rem; }
+  button {
+    flex:1 1 auto; min-width:104px; background:var(--raised); color:var(--text);
+    border:1px solid #2c2c31; border-radius:8px; padding:.5rem .8rem;
+    font:inherit; font-size:.78rem; cursor:pointer;
+    transition:background .12s ease, border-color .12s ease, color .12s ease, transform .06s ease;
+  }
+  button:hover:not(:disabled) { background:#1d1d21; border-color:#3d3d44; }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button:disabled { opacity:.35; cursor:default; }
+  button.primary { background:#12242c; border-color:#2b4a5a; color:#bae6fd; }
+  button.primary:hover:not(:disabled) { background:#173039; border-color:#3d6478; }
+  button.danger:hover:not(:disabled) { border-color:#5c2a2a; color:var(--red); background:#1d1315; }
+  button.icon { flex:0 0 auto; min-width:0; padding:.4rem .6rem; font-size:.75rem; }
+
+  input {
+    width:100%; background:#0c0c0e; color:var(--text); border:1px solid #2a2a2f;
+    border-radius:8px; padding:.5rem .65rem; font:inherit; font-size:.78rem;
+    transition:border-color .12s ease;
+  }
+  input::placeholder { color:#55555c; }
+  input:focus { outline:none; border-color:#3d6478; box-shadow:0 0 0 3px rgba(125,211,252,.08); }
+  .fields { display:grid; grid-template-columns:1fr 5rem; gap:.45rem; margin:0 0 .6rem; }
+
+  .muted { color:var(--faint); font-size:.73rem; line-height:1.55; }
+  .note { font-size:.75rem; line-height:1.6; margin-top:.65rem; color:var(--dim); }
+  .note .bad-text { color:var(--red); }
+  .note .warn-text { color:var(--amber); }
+
+  .pair-result { margin-top:.75rem; padding-top:.75rem; border-top:1px solid var(--line-soft); }
+  .pair-result a { overflow-wrap:anywhere; font-size:.76rem; }
+
+  /* log ------------------------------------------------------------------- */
+  .log-card { padding:0; overflow:hidden; display:flex; flex-direction:column; }
+  .log-head {
+    display:flex; align-items:center; gap:.5rem; padding:.55rem .8rem;
+    border-bottom:1px solid var(--line-soft); background:#0c0c0e;
+    font-size:.68rem; letter-spacing:.11em; text-transform:uppercase; color:var(--faint);
+  }
+  .log-head .job { text-transform:none; letter-spacing:0; color:var(--dim); margin-left:auto; }
+  pre#log {
+    margin:0; padding:.75rem .8rem; white-space:pre-wrap; word-break:break-word;
+    color:#9d9da5; font-size:.73rem; line-height:1.55; max-height:16rem; overflow:auto;
+    background:#0b0b0d;
+  }
+  pre#log::-webkit-scrollbar { width:9px; }
+  pre#log::-webkit-scrollbar-thumb { background:#25252a; border-radius:9px; border:2px solid #0b0b0d; }
+
+  /* release notes / commits ------------------------------------------------ */
+  #notes { margin-top:.8rem; border-top:1px solid var(--line-soft); padding-top:.3rem;
+           max-height:24rem; overflow:auto; }
+  .rel { padding:.65rem 0; border-bottom:1px solid var(--line-soft); }
   .rel:last-child { border-bottom:0; }
-  .rel h3 { font-size:.82rem; margin:0 0 .15rem; font-weight:600; }
-  .rel time { color:#6e6e6e; font-size:.75rem; }
-  .rel ul { margin:.5rem 0 0; padding-left:1.1rem; }
-  .rel li { color:#b4b4b4; margin:.2rem 0; }
-  .rel .sub { color:#7a7a7a; margin:.6rem 0 .1rem; font-size:.75rem;
-              text-transform:uppercase; letter-spacing:.05em; }
-  .scope { color:#c084fc; }
+  .rel h3 { font-size:.78rem; margin:0 0 .1rem; font-weight:600; color:#dcdce0; }
+  .rel time { color:var(--faint); font-size:.7rem; }
+  .rel ul { margin:.4rem 0 0; padding-left:1.05rem; }
+  .rel li { color:#a9a9b1; margin:.18rem 0; font-size:.75rem; }
+  .rel .sub { color:var(--faint); margin:.55rem 0 .1rem; font-size:.68rem;
+              text-transform:uppercase; letter-spacing:.09em; }
+  .scope { color:var(--violet); }
+
+  /* stage / iframe --------------------------------------------------------- */
+  .bar {
+    display:flex; align-items:center; gap:.5rem; padding:.5rem .7rem;
+    border-bottom:1px solid var(--line); background:#0d0d0f; flex:none;
+  }
+  .bar .url {
+    flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:.74rem; color:var(--dim); padding:.3rem .6rem;
+    background:#0a0a0b; border:1px solid var(--line-soft); border-radius:7px;
+  }
+  .frame-wrap { position:relative; flex:1 1 auto; min-height:0; }
+  iframe#frame { width:100%; height:100%; border:0; background:#0a0a0b; display:block; }
+  .placeholder {
+    position:absolute; inset:0; display:grid; place-content:center; justify-items:center;
+    gap:.9rem; text-align:center; padding:2rem; background:#08080a;
+  }
+  .placeholder h2 { font-size:.9rem; font-weight:600; margin:0; }
+  .placeholder p { margin:0; max-width:34rem; }
+  .placeholder .actions { justify-content:center; }
+  .spinner {
+    width:22px; height:22px; border-radius:50%; border:2px solid #26262c;
+    border-top-color:var(--accent); animation:spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  @media (max-width: 900px) {
+    .app, .app.collapsed { grid-template-columns:1fr; grid-template-rows:auto 70vh; height:auto; }
+    .side { border-right:0; border-bottom:1px solid var(--line); opacity:1 !important; pointer-events:auto !important; }
+    .stage { height:70vh; }
+    #collapse { display:none; }
+  }
 </style>
-<main>
-  <h1>t3code service</h1>
 
-  <div class="card">
-    <dl id="status"><div class="row"><dt>loading…</dt><dd></dd></div></dl>
-  </div>
+<div class="app" id="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="mark">T3</div>
+      <div>
+        <h1>t3code</h1>
+        <div class="sub">service control</div>
+      </div>
+    </div>
 
-  <div class="card">
-    <div class="row" style="padding-top:0">
-      <dt>version</dt>
-      <dd id="version">—</dd>
-    </div>
-    <div class="actions" style="margin-top:.75rem">
-      <button id="changelog">What's changed</button>
-      <button id="update">Update &amp; restart</button>
-    </div>
-    <div id="notes" hidden></div>
-  </div>
+    <div class="side-body">
+      <section class="card">
+        <div class="state">
+          <span class="dot" id="state-dot"></span>
+          <span class="label" id="state-label">loading…</span>
+          <span class="meta" id="state-meta"></span>
+        </div>
+        <dl id="status"></dl>
+        <div class="actions" style="margin-top:.8rem">
+          <button data-action="start">Start</button>
+          <button data-action="restart">Restart</button>
+          <button data-action="stop" class="danger">Stop</button>
+        </div>
+      </section>
 
-  <div class="card" id="fork-card" hidden>
-    <div class="row" style="padding-top:0"><dt>fork</dt><dd id="fork-branch">—</dd></div>
-    <dl id="fork-status"></dl>
-    <div class="actions" style="margin-top:.75rem">
-      <button id="fork-deploy">Sync, build &amp; deploy</button>
-      <button id="fork-merge-dev">Merge dev, build &amp; deploy</button>
-      <button id="fork-rebuild">Rebuild &amp; deploy</button>
-    </div>
-    <div id="fork-note" class="muted" style="margin-top:.6rem"></div>
-    <div id="fork-dev-note" class="muted" style="margin-top:.35rem"></div>
-    <div id="fork-commits" hidden></div>
-  </div>
+      <section class="card">
+        <h2>version <span class="tag" id="version">—</span></h2>
+        <div class="actions">
+          <button id="changelog">What's changed</button>
+          <button id="update">Update &amp; restart</button>
+        </div>
+        <div id="notes" hidden></div>
+      </section>
 
-  <div class="card">
-    <div class="actions">
-      <button data-action="start">Start</button>
-      <button data-action="restart">Restart</button>
-      <button data-action="stop" class="danger">Stop</button>
-    </div>
-  </div>
+      <section class="card" id="fork-card" hidden>
+        <h2>fork <span class="tag" id="fork-branch">—</span></h2>
+        <dl id="fork-status"></dl>
+        <div class="actions" style="margin-top:.8rem">
+          <button id="fork-deploy" class="primary">Sync, build &amp; deploy</button>
+          <button id="fork-merge-dev">Merge dev &amp; deploy</button>
+          <button id="fork-rebuild">Rebuild &amp; deploy</button>
+        </div>
+        <div id="fork-note" class="note"></div>
+        <div id="fork-dev-note" class="note" style="margin-top:.3rem"></div>
+        <div id="fork-commits" hidden></div>
+      </section>
 
-  <div class="card">
-    <div class="row" style="padding-top:0"><dt>pair a client</dt><dd>Tailscale Serve</dd></div>
-    <div class="fields">
-      <input id="pair-label" aria-label="Client label" placeholder="client label">
-      <input id="pair-ttl" aria-label="Link lifetime" value="15m">
-      <input id="pair-port" aria-label="HTTPS port" type="number" min="1" max="65535" value="__PAIR_PORT__">
-    </div>
-    <div class="actions">
-      <button id="pair">Create client link</button>
-      <button id="pair-admin">Create administrator link</button>
-    </div>
-    <div class="muted" style="margin-top:.6rem">Administrator links restart T3 and grant access management.</div>
-    <div id="pair-result" class="pair-result" hidden></div>
-  </div>
+      <section class="card">
+        <h2>pair a client <span class="tag">Tailscale Serve</span></h2>
+        <div class="fields">
+          <input id="pair-label" aria-label="Client label" placeholder="client label">
+          <input id="pair-ttl" aria-label="Link lifetime" value="15m">
+        </div>
+        <div class="actions">
+          <button id="pair">Client link</button>
+          <button id="pair-admin">Administrator link</button>
+        </div>
+        <div class="muted" style="margin-top:.55rem">Administrator links restart T3 and grant access management.</div>
+        <div id="pair-result" class="pair-result" hidden></div>
+      </section>
 
-  <pre id="log">ready</pre>
-</main>
+      <section class="card log-card" style="margin-top:auto">
+        <div class="log-head">activity <span class="job" id="log-job"></span></div>
+        <pre id="log">ready</pre>
+      </section>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <div class="bar">
+      <button id="collapse" class="icon" title="Toggle sidebar" aria-label="Toggle sidebar">☰</button>
+      <span class="url" id="frame-url">not published</span>
+      <button id="frame-reload" class="icon" title="Reload">⟳</button>
+      <button id="frame-open" class="icon" title="Open in a new tab">↗</button>
+    </div>
+    <div class="frame-wrap">
+      <iframe id="frame" title="T3 Code" hidden
+        allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+      <div class="placeholder" id="frame-placeholder">
+        <div class="spinner" id="frame-spinner"></div>
+        <h2 id="frame-title">waiting for T3 Code…</h2>
+        <p class="muted" id="frame-hint">Looking for the Tailscale Serve URL for this service.</p>
+        <div class="actions" id="frame-actions" hidden>
+          <button id="frame-retry" class="primary">Retry</button>
+          <button id="frame-open-2">Open in a new tab</button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
 <script>
 const TOKEN = '__TOKEN__'
 const $ = (id) => document.getElementById(id)
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
 const log = (msg) => { $('log').textContent = typeof msg === 'string' ? msg : JSON.stringify(msg, null, 2) }
 
 function dotClass(active) {
@@ -813,32 +1265,160 @@ function dotClass(active) {
   return 'warn'
 }
 
+// "Wed 2026-08-05 16:00:00 PDT" -> "2h 14m", so uptime reads at a glance.
+function uptime(stamp) {
+  const parsed = Date.parse((stamp || '').replace(/^\w{3} /, ''))
+  if (!parsed) return ''
+  const seconds = Math.max(0, Math.floor((Date.now() - parsed) / 1000))
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  if (days) return 'up ' + days + 'd ' + hours + 'h'
+  if (hours) return 'up ' + hours + 'h ' + minutes + 'm'
+  return 'up ' + minutes + 'm'
+}
+
 async function refresh() {
-  const s = await (await fetch('/api/status')).json()
+  const s = await (await fetch('/_dash/status')).json()
+  // Serve publishes the dashboard; T3 itself is the tailnet address it binds to.
   const serviceUrl = s.url
-    ? '<a href="' + esc(s.url) + '">' + esc(s.url) + '</a>'
+    ? '<a href="' + esc(s.url) + '" target="_blank" rel="noreferrer">' + esc(s.url) + '</a>'
     : '<span class="muted">not published</span>'
+
+  managed = s.managed !== false
+  if (!managed) {
+    for (const b of document.querySelectorAll('[data-action]')) b.disabled = true
+    $('update').disabled = true
+    $('update').textContent = 'Managed by dev server'
+  }
+
+  $('state-dot').className = 'dot ' + dotClass(s.active)
+  $('state-label').textContent = s.active + (s.sub && s.sub !== s.active ? ' · ' + s.sub : '')
+  $('state-meta').textContent = s.active === 'active' ? uptime(s.startedAt) : s.enabled
+
   $('status').innerHTML = [
-    ['state', '<span class="dot ' + dotClass(s.active) + '"></span>' + s.active + (s.sub ? ' (' + s.sub + ')' : '')],
-    ['unit', s.enabled],
+    ['unit', esc(s.unit)],
+    ['enabled', esc(s.enabled)],
     ['pid', s.pid ?? '—'],
-    ['started', s.startedAt ?? '—'],
-    ['restarts', s.restarts],
-    ['url', serviceUrl],
+    ['restarts', esc(s.restarts)],
+    ['dashboard', serviceUrl],
+    ['t3code', s.origin ? esc(s.origin) : '<span class="muted">not running</span>'],
   ].map(([k, v]) => '<div class="row"><dt>' + k + '</dt><dd>' + v + '</dd></div>').join('')
+
+  setFrameUrl()
   installed = s.installed
   renderVersion()
 }
 
-let installed = null, latest = null, upToDate = null
+// ---------------------------------------------------------------------------
+// embedded T3 Code
+// ---------------------------------------------------------------------------
+
+// T3 is proxied under this origin, so the frame is same-origin: /ws answers
+// 401 until this browser holds a session, which is a precise "are we paired?"
+// signal that no cross-origin embed could give us.
+let pairing = false
+
+function showPlaceholder(title, hint, showActions) {
+  $('frame').hidden = true
+  $('frame-placeholder').hidden = false
+  $('frame-spinner').hidden = Boolean(showActions)
+  $('frame-title').textContent = title
+  $('frame-hint').textContent = hint
+  $('frame-actions').hidden = !showActions
+}
+
+function showFrame() {
+  $('frame').hidden = false
+  $('frame-placeholder').hidden = true
+}
+
+// A plain GET on the socket endpoint answers auth_invalid (401) without a
+// session, and 400 "not an upgrade" once the credential is accepted -- so the
+// error payload, not the status, is the reliable signal.
+async function isPaired() {
+  try {
+    const res = await fetch('/ws', { cache: 'no-store' })
+    if (res.status === 401) return false
+    if (res.ok) return true
+    const body = await res.json().catch(() => null)
+    return body?.code !== 'auth_invalid'
+  } catch {
+    return false
+  }
+}
+
+// Mint a link and consume it in the frame. The token lives in the fragment, so
+// it is re-pointed at this origin rather than the Tailscale Serve one: that way
+// the cookie is set first-party and the embedded console can use it.
+async function pairFrame() {
+  if (pairing) return
+  pairing = true
+  showPlaceholder('pairing this browser…', 'Creating a short-lived link and completing it in place.', false)
+  try {
+    const params = new URLSearchParams({ label: 'dashboard embed', ttl: '15m' })
+    const res = await fetch('/_dash/pair?' + params, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const result = await res.json()
+    if (!res.ok) throw new Error(result.error ?? 'pairing failed')
+
+    const local = new URL('/pair', location.origin)
+    local.hash = new URL(result.pairingUrl).hash
+    await new Promise((resolve) => {
+      $('frame').addEventListener('load', resolve, { once: true })
+      $('frame').src = local.toString()
+    })
+    // The pair page exchanges the token after it loads; wait for the session.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((r) => setTimeout(r, 500))
+      if (await isPaired()) {
+        log('paired this browser with T3 Code')
+        return loadFrame()
+      }
+    }
+    showPlaceholder('pairing did not complete', 'The link was created but no session appeared. Open T3 Code in its own tab and pair there.', true)
+  } catch (err) {
+    showPlaceholder('could not pair', err.message, true)
+  } finally {
+    pairing = false
+  }
+}
+
+async function loadFrame() {
+  if (!(await isPaired())) return pairFrame()
+  showPlaceholder('loading T3 Code…', location.origin, false)
+  $('frame').addEventListener('load', showFrame, { once: true })
+  $('frame').src = '/?embed=1'
+}
+
+// The frame is always this origin's root -- T3 is reached through the proxy.
+function setFrameUrl() {
+  $('frame-url').textContent = location.origin + '/'
+}
+
+// ?embed=1 makes the root serve the console rather than this page.
+const openFrame = () => window.open('/?embed=1', '_blank')
+$('frame-open').onclick = openFrame
+$('frame-open-2').onclick = openFrame
+$('frame-retry').onclick = loadFrame
+$('frame-reload').onclick = loadFrame
+
+$('collapse').onclick = () => {
+  const collapsed = $('app').classList.toggle('collapsed')
+  try { localStorage.setItem('t3code-sidebar', collapsed ? 'collapsed' : 'open') } catch {}
+}
+try {
+  if (localStorage.getItem('t3code-sidebar') === 'collapsed') $('app').classList.add('collapsed')
+} catch {}
+
+let installed = null, latest = null, upToDate = null, managed = true
 
 function renderVersion() {
   if (!installed) return
   if (!latest) { $('version').textContent = installed; return }
   const current = upToDate ?? latest === installed
   $('version').innerHTML = current
-    ? installed + ' <span style="color:#6e6e6e">(latest)</span>'
-    : installed + ' <span style="color:#f59e0b">&rarr; ' + latest + '</span>'
+    ? esc(installed) + ' <span style="color:var(--faint)">(latest)</span>'
+    : esc(installed) + ' <span style="color:var(--amber)">&rarr; ' + esc(latest) + '</span>'
   // Source mode owns the installed binary; the npm button stays out of it.
   if (forkMode) return
   $('update').disabled = current
@@ -847,7 +1427,7 @@ function renderVersion() {
 
 async function checkUpdates() {
   try {
-    const r = await (await fetch('/api/latest')).json()
+    const r = await (await fetch('/_dash/latest')).json()
     installed = r.installed
     latest = r.latest
     upToDate = r.upToDate
@@ -863,13 +1443,12 @@ async function createPairing(administrative = false) {
   const params = new URLSearchParams({
     label: $('pair-label').value,
     ttl: $('pair-ttl').value,
-    port: $('pair-port').value,
     administrative: String(administrative),
   })
   btn.disabled = true
   btn.textContent = 'creating…'
   try {
-    const response = await fetch('/api/pair?' + params, {
+    const response = await fetch('/_dash/pair?' + params, {
       method: 'POST',
       headers: { 'x-token': TOKEN },
     })
@@ -903,12 +1482,12 @@ async function createPairing(administrative = false) {
 }
 
 async function act(name, btn) {
-  const buttons = [...document.querySelectorAll('button')]
+  const buttons = [...document.querySelectorAll('.side-body button')]
   buttons.forEach((b) => (b.disabled = true))
   const label = btn.textContent
   btn.textContent = '…'
   try {
-    const res = await fetch('/api/action?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await fetch('/_dash/action?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
     log(await res.json())
   } catch (err) {
     log('failed: ' + err.message)
@@ -931,8 +1510,6 @@ $('pair-admin').onclick = () => {
     createPairing(true)
   }
 }
-
-const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
 
 // The release bodies are generated notes: '## Heading' plus '* item by @who in <url>'.
 // Render just that shape rather than pulling in a markdown parser.
@@ -969,7 +1546,7 @@ $('changelog').onclick = async (e) => {
   if (!box.hidden) { box.hidden = true; return }
   btn.disabled = true; btn.textContent = 'loading…'
   try {
-    const r = await (await fetch('/api/changelog')).json()
+    const r = await (await fetch('/_dash/changelog')).json()
     box.innerHTML = r.releases.length
       ? r.releases.reverse().map((rel) =>
           '<div class="rel"><h3>' + esc(rel.version) + '</h3>' +
@@ -995,25 +1572,26 @@ function renderFork(f) {
   $('update').textContent = 'Managed by fork'
 
   $('fork-branch').textContent = f.branch + ' @ ' + (f.tip ?? '—')
+  const flag = (text) => ' <span style="color:var(--amber)">(' + text + ')</span>'
   $('fork-status').innerHTML = [
-    ['checked out', esc(f.checkedOut ?? '—') + (f.dirty ? ' <span style="color:#f59e0b">(dirty)</span>' : '')],
+    ['checked out', esc(f.checkedOut ?? '—') + (f.dirty ? flag('dirty') : '')],
     ['main behind upstream', String(f.mainBehind)],
     [f.branch + ' behind main', String(f.deployBehind)],
-    [f.dev.branch + ' ahead / behind ' + f.branch, String(f.dev.ahead) + ' / ' + String(f.dev.behind)],
-    ['development worktree', esc(f.dev.repo) + (f.dev.dirty ? ' <span style="color:#f59e0b">(dirty)</span>' : '')],
-    ['built', f.built ? esc(f.built) + (f.needsRebuild ? ' <span style="color:#f59e0b">(stale)</span>' : '') : '—'],
-  ].map(([k, v]) => '<div class="row"><dt>' + k + '</dt><dd>' + v + '</dd></div>').join('')
+    [f.dev.branch + ' ahead / behind', String(f.dev.ahead) + ' / ' + String(f.dev.behind)],
+    ['dev worktree', esc((f.dev.repo || '—').split('/').pop()) + (f.dev.dirty ? flag('dirty') : '')],
+    ['built', f.built ? esc(f.built) + (f.needsRebuild ? flag('stale') : '') : '—'],
+  ].map(([k, v]) => '<div class="row"><dt>' + esc(k) + '</dt><dd>' + v + '</dd></div>').join('')
 
   const pending = f.mainBehind > 0 || f.deployBehind > 0
-  const blocked = f.dirty || !f.clean
+  const blocked = f.dirty || !f.clean || !managed
   $('fork-deploy').disabled = blocked || !pending || Boolean(f.active)
-  $('fork-merge-dev').disabled = f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0 || Boolean(f.active)
-  $('fork-rebuild').disabled = f.dirty || Boolean(f.active)
+  $('fork-merge-dev').disabled = !managed || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0 || Boolean(f.active)
+  $('fork-rebuild').disabled = !managed || f.dirty || Boolean(f.active)
 
   $('fork-note').innerHTML = f.dirty
     ? 'Worktree has uncommitted changes. Resolve them in ' + esc(f.repo) + ' first.'
     : !f.clean
-      ? '<span style="color:#ef4444">Conflicts — merge by hand:</span> ' + esc(f.conflicts.join(', '))
+      ? '<span class="bad-text">Conflicts — merge by hand:</span> ' + esc(f.conflicts.join(', '))
       : pending
         ? f.mainBehind + ' upstream commit(s) ready to merge and deploy.'
         : f.needsRebuild
@@ -1023,7 +1601,7 @@ function renderFork(f) {
   $('fork-dev-note').innerHTML = f.dev.dirty
     ? 'Development changes are safe in ' + esc(f.dev.repo) + '. Commit them before merging into ' + esc(f.branch) + '.'
     : !f.dev.clean
-      ? '<span style="color:#ef4444">Dev merge conflicts — resolve in the dev worktree:</span> ' + esc(f.dev.conflicts.join(', '))
+      ? '<span class="bad-text">Dev merge conflicts — resolve in the dev worktree:</span> ' + esc(f.dev.conflicts.join(', '))
       : f.dev.ahead > 0
         ? f.dev.ahead + ' committed dev change(s) ready to merge.'
         : 'No committed dev changes to merge.'
@@ -1038,7 +1616,7 @@ function renderFork(f) {
 
 async function refreshFork() {
   try {
-    const r = await fetch('/api/fork')
+    const r = await fetch('/_dash/fork')
     if (!r.ok) return
     const f = await r.json()
     renderFork(f)
@@ -1053,9 +1631,11 @@ function pollJob(id) {
   clearInterval(polling)
   polling = setInterval(async () => {
     try {
-      const job = await (await fetch('/api/job/' + id)).json()
-      $('log').textContent = '[' + job.state + '] ' + job.step + '\n\n' + job.output
-      $('log').scrollTop = $('log').scrollHeight
+      const job = await (await fetch('/_dash/job/' + id)).json()
+      const pinned = $('log').scrollTop + $('log').clientHeight >= $('log').scrollHeight - 40
+      $('log-job').textContent = job.name + ' · ' + job.state + ' · ' + job.step
+      $('log').textContent = job.output
+      if (pinned) $('log').scrollTop = $('log').scrollHeight
       if (job.state !== 'running') {
         clearInterval(polling)
         polling = null
@@ -1074,7 +1654,7 @@ async function startJob(name) {
   $('fork-merge-dev').disabled = true
   $('fork-rebuild').disabled = true
   try {
-    const res = await fetch('/api/job?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await fetch('/_dash/job?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
     const r = await res.json()
     if (!res.ok) throw new Error(r.error ?? 'could not start')
     pollJob(r.id)
@@ -1101,6 +1681,7 @@ $('fork-merge-dev').onclick = () => {
 refresh()
 checkUpdates()
 refreshFork()
+loadFrame()
 setInterval(refreshFork, 30000)
 setInterval(refresh, 5000)
 // npm registry lookup is slower and far less volatile than local service state
@@ -1118,8 +1699,11 @@ if (REPO) {
   setInterval(fetchRemotes, 15 * 60 * 1000).unref()
 }
 
-const host = await tailnetHost()
-server.listen(PORT, host, () => {
-  console.log(`t3code dashboard on http://${host}:${PORT}`)
+server.on('upgrade', (req, socket, head) => {
+  proxyUpgrade(req, socket, head).catch(() => socket.destroy())
+})
+
+server.listen(PORT, HOST, () => {
+  console.log(`t3code dashboard on http://${HOST}:${PORT}/`)
   if (REPO) console.log(`source mode: ${REPO} (${BRANCH})`)
 })

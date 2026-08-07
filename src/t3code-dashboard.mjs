@@ -566,6 +566,10 @@ const devRunner = {
   output: '',
   error: null,
   child: null,
+  // Whether the exit about to happen was asked for. Without this, a crash
+  // after a successful start reports as a clean stop and no one learns why
+  // the dev console just went away.
+  stopRequested: false,
 }
 
 function devRunnerStatus() {
@@ -601,6 +605,7 @@ function startDevRunner() {
 
   Object.assign(devRunner, {
     state: 'starting', origin: null, home: null, output: '', error: null,
+    stopRequested: false,
   })
 
   // Nothing of this dashboard's own T3 configuration may leak into the
@@ -637,14 +642,18 @@ function startDevRunner() {
     devRunner.error = err.message
   })
   child.on('exit', (code, signal) => {
-    // An exit before the port is a failure. Report it. An exit after the port
-    // is the stop that the user asked for.
+    // Only an exit that was asked for is a stop. Everything else is a
+    // failure, even after a successful start: a crashed runner silently
+    // reported as "stopped" leaves the dev console dead with no explanation.
     const started = Boolean(devRunner.origin)
     const origin = devRunner.origin
+    const wanted = devRunner.stopRequested
     Object.assign(devRunner, {
-      state: started || signal ? 'stopped' : 'failed',
+      state: wanted ? 'stopped' : 'failed',
       pid: null, origin: null, child: null,
-      error: started || signal ? null : `dev runner exited with code ${code}`,
+      error: wanted ? null
+        : started ? `dev runner exited unexpectedly (${signal ?? `code ${code}`})`
+        : `dev runner exited with code ${code}`,
     })
     // Remove the dev credentials only. The deploy token stays correct.
     if (origin) sessionTokens.delete(origin)
@@ -654,6 +663,7 @@ function startDevRunner() {
 }
 
 function stopDevRunner() {
+  devRunner.stopRequested = true
   const pid = devRunner.pid
   if (!pid) {
     devRunner.state = 'stopped'

@@ -11,6 +11,9 @@ import { promisify } from 'node:util'
 const run = promisify(execFile)
 
 const PORT = Number(process.env.T3CODE_DASH_PORT ?? 4124)
+// A second listener that always proxies the dev runner, so the dev console
+// has an origin of its own and can be mounted beside the deploy console.
+const DEV_CONSOLE_PORT = Number(process.env.T3CODE_DEV_CONSOLE_PORT ?? PORT + 1)
 // An empty unit means this instance is not run by systemd -- the no-install
 // dev mode, where the fork's own dev runner owns the process. Service control
 // and the build jobs do not apply there.
@@ -469,22 +472,25 @@ async function status() {
 // Tailscale Serve publishes the dashboard, not T3 directly: T3 is reached
 // through the proxy below, so one HTTPS origin covers both and the embedded
 // console shares the dashboard's session cookie.
-async function publishedUrl() {
+async function serveUrlFor(proxyTarget) {
   try {
     const { stdout } = await run('/usr/bin/tailscale', ['serve', 'status', '--json'], {
       timeout: 10_000,
       maxBuffer: 8 * 1024 * 1024,
     })
     const serve = JSON.parse(stdout)
-    const self = `http://${HOST}:${PORT}`
     const match = Object.entries(serve.Web ?? {}).find(([, site]) =>
-      Object.values(site.Handlers ?? {}).some((handler) => handler.Proxy === self),
+      Object.values(site.Handlers ?? {}).some((handler) => handler.Proxy === proxyTarget),
     )
     return match ? `https://${match[0]}` : null
   } catch {
     return null
   }
 }
+
+const publishedUrl = () => serveUrlFor(`http://${HOST}:${PORT}`)
+// The dev console's own published origin; see the dev console listener below.
+const devPublishedUrl = () => serveUrlFor(`http://${HOST}:${DEV_CONSOLE_PORT}`)
 
 // ---------------------------------------------------------------------------
 // T3 proxy
@@ -572,7 +578,7 @@ const devRunner = {
   stopRequested: false,
 }
 
-function devRunnerStatus() {
+async function devRunnerStatus() {
   return {
     configured: Boolean(DEV_REPO),
     repo: DEV_REPO || null,
@@ -581,6 +587,10 @@ function devRunnerStatus() {
     origin: devRunner.origin,
     error: devRunner.error,
     output: stripAnsi(devRunner.output).slice(-8000),
+    // Where a browser reaches the dev console: the published HTTPS origin
+    // when Serve maps it, else the tailnet address of the listener itself.
+    publicUrl: await devPublishedUrl(),
+    directUrl: `http://${HOST}:${DEV_CONSOLE_PORT}`,
   }
 }
 
@@ -751,26 +761,20 @@ async function proxySession(target) {
   }
 }
 
-// This function finds the backend for the request. A cookie on the address of
-// the dashboard holds the choice. Thus the choice applies to your browser
-// only. Other clients on the tailnet continue to use the deploy build.
-const TARGET_COOKIE = 't3code_target'
-
-function cookieValue(header, name) {
-  for (const part of (header ?? '').split(';')) {
-    const [key, ...rest] = part.trim().split('=')
-    if (key === name) return rest.join('=')
-  }
-  return null
-}
-
-async function targetFor(req) {
-  const wanted = cookieValue(req.headers.cookie, TARGET_COOKIE)
-  if (wanted === 'dev' && devRunner.state === 'running' && devRunner.origin) {
-    return { name: 'dev', origin: devRunner.origin, home: devRunner.home, sessionFile: DEV_SESSION_FILE }
-  }
+// Each listener serves exactly one backend. The main origin is always the
+// deploy build, so the stable console can never be rerouted; the dev console
+// has its own origin on DEV_CONSOLE_PORT. Two origins means both consoles can
+// be mounted at once, and switching between them reloads nothing.
+async function deployTarget() {
   const origin = await t3Origin()
   return origin ? { name: 'deploy', origin, home: T3_HOME, sessionFile: SESSION_FILE } : null
+}
+
+function devTarget() {
+  if (devRunner.state === 'running' && devRunner.origin) {
+    return { name: 'dev', origin: devRunner.origin, home: devRunner.home, sessionFile: DEV_SESSION_FILE }
+  }
+  return null
 }
 
 function forwardHeaders(headers, target, token) {
@@ -795,8 +799,7 @@ function forwardHeaders(headers, target, token) {
   return out
 }
 
-async function proxy(req, res) {
-  const backend = await targetFor(req)
+async function proxy(req, res, backend) {
   if (!backend) {
     return json(res, 503, { error: 'T3 Code is not running, so there is nothing to proxy.' })
   }
@@ -820,8 +823,7 @@ async function proxy(req, res) {
 
 // The console is a WebSocket client, so the upgrade has to be proxied too;
 // without this the app loads and then hangs retrying its connection.
-async function proxyUpgrade(req, clientSocket, head) {
-  const backend = await targetFor(req)
+async function proxyUpgrade(req, clientSocket, head, backend) {
   if (!backend) return clientSocket.destroy()
 
   const token = await proxySession(backend)
@@ -1305,6 +1307,10 @@ function mockRunnerStatus() {
     state: mockState.runner,
     origin: mockState.runner === 'running' ? 'http://localhost:1' : null,
     error: null, output: '',
+    // The mock has no real dev console; the direct URL points at this
+    // dashboard's own dev listener, whose placeholder page then shows.
+    publicUrl: null,
+    directUrl: `http://${HOST}:${DEV_CONSOLE_PORT}`,
   }
 }
 
@@ -1469,8 +1475,9 @@ const server = createServer(async (req, res) => {
       return res.end(html)
     }
 
-    // Anything that is not the dashboard page or its API belongs to T3.
-    if (!url.pathname.startsWith(API_PREFIX)) return proxy(req, res)
+    // Anything that is not the dashboard page or its API belongs to the
+    // deploy T3. The dev console lives on its own port.
+    if (!url.pathname.startsWith(API_PREFIX)) return proxy(req, res, await deployTarget())
 
     // In mock mode the canned data answers every API route, so no request
     // below this line touches git, systemd, npm, or the t3 binary.
@@ -1515,15 +1522,15 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/_dash/dev-runner') {
-      return json(res, 200, devRunnerStatus())
+      return json(res, 200, await devRunnerStatus())
     }
 
     if (req.method === 'POST' && url.pathname === '/_dash/dev-runner') {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
       const action = url.searchParams.get('action')
       try {
-        if (action === 'start') return json(res, 200, startDevRunner())
-        if (action === 'stop') return json(res, 200, stopDevRunner())
+        if (action === 'start') return json(res, 200, await startDevRunner())
+        if (action === 'stop') return json(res, 200, await stopDevRunner())
       } catch (err) {
         return json(res, 400, { error: err.message })
       }
@@ -1582,7 +1589,7 @@ const server = createServer(async (req, res) => {
         return json(res, 400, { error: 'invalid TTL; use values such as 15m, 1h, or 2 days' })
       }
 
-      const backend = await targetFor(req)
+      const backend = await deployTarget()
       if (!backend) return json(res, 503, { error: 'T3 Code is not running.' })
 
       const administrative = url.searchParams.get('administrative') === 'true'
@@ -2012,7 +2019,8 @@ const PAGE = String.raw`<!doctype html>
     padding:.2rem .35rem; cursor:pointer;
   }
   .frame-wrap { position:relative; flex:1 1 auto; min-height:0; }
-  iframe#frame { width:100%; height:100%; border:0; background:#0a0a0b; display:block; }
+  iframe#frame, iframe#frame-dev { width:100%; height:100%; border:0; background:#0a0a0b; display:block; }
+  iframe#frame-dev { position:absolute; inset:0; }
   .placeholder {
     position:absolute; inset:0; display:grid; place-content:center; justify-items:center;
     gap:.9rem; text-align:center; padding:2rem; background:#08080a;
@@ -2195,6 +2203,11 @@ const PAGE = String.raw`<!doctype html>
     <div class="frame-wrap">
       <iframe id="frame" title="T3 Code" hidden
         allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+      <!-- The dev console keeps its own origin and its own frame. Both frames
+           stay mounted; the tabs only choose which one is visible, so
+           switching reloads neither console. -->
+      <iframe id="frame-dev" title="T3 Code (dev)" hidden
+        allow="clipboard-read; clipboard-write; fullscreen"></iframe>
       <div class="placeholder" id="frame-placeholder">
         <div class="spinner" id="frame-spinner"></div>
         <h2 id="frame-title">waiting for T3 Code…</h2>
@@ -2301,18 +2314,30 @@ async function refresh() {
 // signal that no cross-origin embed could give us.
 let pairing = false
 
+// Which console the tabs picked, and what the deploy side wants to show. Both
+// frames stay mounted; only visibility changes, so switching reloads nothing.
+let shownConsole = 'deploy'
+let deployView = 'placeholder'
+
+function applyView() {
+  const dev = shownConsole === 'dev'
+  $('frame-dev').hidden = !dev
+  $('frame').hidden = dev || deployView !== 'frame'
+  $('frame-placeholder').hidden = dev || deployView !== 'placeholder'
+}
+
 function showPlaceholder(title, hint, showActions) {
-  $('frame').hidden = true
-  $('frame-placeholder').hidden = false
+  deployView = 'placeholder'
   $('frame-spinner').hidden = Boolean(showActions)
   $('frame-title').textContent = title
   $('frame-hint').textContent = hint
   $('frame-actions').hidden = !showActions
+  applyView()
 }
 
 function showFrame() {
-  $('frame').hidden = false
-  $('frame-placeholder').hidden = true
+  deployView = 'frame'
+  applyView()
 }
 
 // A plain GET on the socket endpoint answers auth_invalid (401) without a
@@ -2382,7 +2407,14 @@ async function loadFrame() {
 // load. It is not a control for a frame that operates correctly.
 $('frame-open-2').onclick = () => window.open('/?embed=1', '_blank')
 $('frame-retry').onclick = loadFrame
-$('frame-reload').onclick = loadFrame
+// Reload whichever console is visible; the hidden one is left alone.
+$('frame-reload').onclick = () => {
+  if (shownConsole === 'dev') {
+    if (devConsoleUrl) $('frame-dev').src = devConsoleUrl + '/?embed=1'
+  } else {
+    loadFrame()
+  }
+}
 
 $('collapse').onclick = () => {
   const collapsed = $('app').classList.toggle('collapsed')
@@ -2875,29 +2907,27 @@ for (const [id, name, title, message] of JOB_UI) {
 // dev runner and the console tabs
 // ---------------------------------------------------------------------------
 
-// This function gives the backend that this browser shows. A cookie on this
-// address holds the choice. Thus each request from the console in the frame
-// carries the choice, and no other client on the tailnet changes.
-function frameTarget() {
-  const match = /(?:^|;\s*)t3code_target=([^;]*)/.exec(document.cookie)
-  return match?.[1] === 'dev' ? 'dev' : 'deploy'
-}
+// The tabs choose which mounted frame is visible. The deploy console lives on
+// this origin; the dev console on its own origin (its listener proxies the
+// runner and nothing else), so both can be alive at once and switching is
+// instant.
+let devConsoleUrl = null
 
-function setFrameTarget(name) {
-  document.cookie = 't3code_target=' + name + '; path=/; SameSite=Lax; max-age=' + 60 * 60 * 24 * 30
+function showConsole(name) {
+  shownConsole = name
   for (const tab of document.querySelectorAll('.tab')) {
     tab.setAttribute('aria-selected', String(tab.dataset.target === name))
   }
+  applyView()
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
   tab.onclick = () => {
-    if (frameTarget() === tab.dataset.target) return
-    setFrameTarget(tab.dataset.target)
-    // Each backend has different credentials. Thus load the frame again
-    // through the pairing steps. Do not change the src of a console that
-    // operates.
-    loadFrame()
+    if (shownConsole === tab.dataset.target) return
+    if (tab.dataset.target === 'dev' && !devConsoleUrl) {
+      return log('the dev console has no published origin; re-run install.sh to add its Serve mapping')
+    }
+    showConsole(tab.dataset.target)
   }
 }
 
@@ -2927,12 +2957,23 @@ function renderDevRunner(r) {
     : r.state === 'stopping' ? 'stopping…'
     : running ? 'Stop' : 'Start'
 
-  // A tab for a backend that does not operate gives an HTTP 503 in the
-  // frame.
+  // While the runner operates, mount the dev console in its frame right away
+  // so it loads in the background and the first switch to it is instant. The
+  // page picks the origin that matches its own scheme: the published HTTPS
+  // one behind Serve, or the listener's tailnet address over plain http.
   $('frame-tabs').hidden = !running
-  if (!running && frameTarget() === 'dev') {
-    setFrameTarget('deploy')
-    loadFrame()
+  if (running) {
+    const url = location.protocol === 'https:' ? r.publicUrl : r.directUrl
+    if (url && devConsoleUrl !== url) {
+      devConsoleUrl = url
+      $('frame-dev').src = url + '/?embed=1'
+    }
+  } else {
+    if (shownConsole === 'dev') showConsole('deploy')
+    if (devConsoleUrl) {
+      devConsoleUrl = null
+      $('frame-dev').src = 'about:blank'
+    }
   }
 
   // Only a failure earns a line of text; every other state is in the heading.
@@ -2996,7 +3037,6 @@ async function initMock() {
 }
 initMock()
 
-setFrameTarget(frameTarget())
 refresh()
 checkUpdates()
 refreshFork()
@@ -3021,11 +3061,49 @@ if (HOST_REPO && !MOCK) {
   setInterval(() => gitHostOrNull('fetch', '--prune', 'origin'), 15 * 60 * 1000).unref()
 }
 
-server.on('upgrade', (req, socket, head) => {
-  proxyUpgrade(req, socket, head).catch(() => socket.destroy())
+server.on('upgrade', async (req, socket, head) => {
+  proxyUpgrade(req, socket, head, await deployTarget()).catch(() => socket.destroy())
+})
+
+// The dev console's own origin. Everything here goes to the dev runner; when
+// it is not running, a document gets a small page saying so instead of a
+// silent fallback to the deploy build, which once served the deploy SPA's
+// index.html for dev module paths and broke both consoles at once.
+const DEV_UNAVAILABLE = `<!doctype html>
+<meta charset="utf-8"><title>t3code dev</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin:0; height:100dvh; display:grid; place-content:center; text-align:center;
+         background:#08080a; color:#8b8b93; font:13.5px/1.6 ui-monospace,Menlo,Consolas,monospace; }
+  h1 { font-size:.9rem; color:#e9e9ec; margin:0 0 .5rem; }
+</style>
+<h1>dev server is not running</h1>
+<p>Start it from the dashboard sidebar.</p>`
+
+const devConsole = createServer((req, res) => {
+  const backend = devTarget()
+  if (!backend) {
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      return res.end(DEV_UNAVAILABLE)
+    }
+    return json(res, 503, { error: 'the dev server is not running' })
+  }
+  return proxy(req, res, backend)
+})
+devConsole.on('upgrade', (req, socket, head) => {
+  proxyUpgrade(req, socket, head, devTarget()).catch(() => socket.destroy())
+})
+devConsole.on('error', (err) => {
+  console.error(`dev console listener failed: ${err.message}`)
 })
 
 server.listen(PORT, HOST, () => {
   console.log(`t3code dashboard on http://${HOST}:${PORT}/`)
   if (REPO) console.log(`source mode: ${REPO} (${BRANCH})`)
 })
+if (DEV_REPO) {
+  devConsole.listen(DEV_CONSOLE_PORT, HOST, () => {
+    console.log(`dev console on http://${HOST}:${DEV_CONSOLE_PORT}/`)
+  })
+}

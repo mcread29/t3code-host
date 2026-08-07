@@ -18,12 +18,16 @@ if [ "$instance" = production ]; then
   service_port="${T3CODE_PORT:-4123}"
   dashboard_port="${T3CODE_DASH_PORT:-4124}"
   pair_port="${T3CODE_PAIR_PORT:-443}"
+  dev_serve_port="${T3CODE_DEV_SERVE_PORT:-8447}"
 else
   instance_suffix="-$instance"
   service_port="${T3CODE_TEST_PORT:-5123}"
   dashboard_port="${T3CODE_TEST_DASH_PORT:-5124}"
   pair_port="${T3CODE_TEST_PAIR_PORT:-8446}"
+  dev_serve_port="${T3CODE_TEST_DEV_SERVE_PORT:-8448}"
 fi
+# The dev console listens beside the dashboard; see t3code-dashboard.mjs.
+dev_console_port=$((dashboard_port + 1))
 
 app_name="t3code-host$instance_suffix"
 service_unit="t3code$instance_suffix.service"
@@ -352,10 +356,27 @@ host="$(tailscale ip -4 | head -n1)"
 # stay on its tailnet address.
 if [ "${T3CODE_SKIP_SERVE:-0}" = 1 ]; then
   echo "Skipping the Tailscale Serve mapping (T3CODE_SKIP_SERVE=1)."
-elif ! tailscale serve --bg --https="$pair_port" "http://${host}:${dashboard_port}" >/dev/null; then
-  echo "Tailscale Serve could not publish HTTPS port $pair_port." >&2
-  echo "Check: tailscale serve status" >&2
-  exit 1
+else
+  if ! tailscale serve --bg --https="$pair_port" "http://${host}:${dashboard_port}" >/dev/null; then
+    echo "Tailscale Serve could not publish HTTPS port $pair_port." >&2
+    echo "Check: tailscale serve status" >&2
+    exit 1
+  fi
+  # The dev console needs an HTTPS origin of its own: the deploy and dev
+  # consoles are mounted side by side, and one origin cannot serve both.
+  dev_serve_owner="$(serve_site "$dev_serve_port" | cut -f2)"
+  case "${dev_serve_owner:-}" in
+    '' | *":$dev_console_port")
+      if ! tailscale serve --bg --https="$dev_serve_port" "http://${host}:${dev_console_port}" >/dev/null; then
+        echo "Note: could not publish the dev console on HTTPS port $dev_serve_port." >&2
+        echo "      The dev tab will not work over HTTPS until it is mapped." >&2
+      fi
+      ;;
+    *)
+      echo "Note: Serve port $dev_serve_port already proxies to $dev_serve_owner; leaving it." >&2
+      echo "      Pick another with T3CODE_DEV_SERVE_PORT to publish the dev console." >&2
+      ;;
+  esac
 fi
 
 serve_url="$(serve_site "$pair_port" | cut -f1)"

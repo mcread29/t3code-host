@@ -6,7 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HOME=@HOME@
-Environment=PATH=@NODE_DIR@:@HOME@/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# @EXTRA_PATH@ holds the directory of mise, when this machine has mise. The npm
+# shim calls `mise reshim` after a global install. Without mise on the path,
+# that call fails with code 127, and the deploy job stops after a correct
+# install.
+Environment=PATH=@NODE_DIR@:@EXTRA_PATH@@HOME@/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Environment=T3CODE_BIN=@T3_BIN@
 Environment=T3CODE_HOME=@T3_HOME@
 Environment=NPM_BIN=@NPM_BIN@

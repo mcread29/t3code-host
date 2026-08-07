@@ -107,14 +107,29 @@ fi
 pnpm_bin="$(command -v pnpm)"
 node_dir="$(dirname "$node_bin")"
 
+# The npm shim of mise calls `mise reshim` after a global install. The unit must
+# have mise on its path. If it does not, the deploy job stops with code 127
+# after a correct install. Find the directory. Do not guess it.
+mise_bin="$(command -v mise 2>/dev/null || true)"
+if [ -n "$mise_bin" ]; then
+  extra_path="$(dirname "$mise_bin"):"
+else
+  extra_path=""
+fi
+
 npm_install_args=(install --global)
 if [ -n "$npm_prefix" ]; then
   npm_install_args+=(--prefix "$npm_prefix")
 fi
 
-# A dashboard-only change does not need the multi-minute source build, so
-# T3CODE_SKIP_BUILD refreshes just the dashboard, launcher, units, and Serve
-# mapping. The running T3 build is left exactly as it is.
+# Each path has one blast radius:
+#
+#   units.sh     the units, the launcher, the dashboard, and the Serve mapping.
+#                It restarts the dashboard. It does not touch T3 Code.
+#   install.sh   each of those, and the source build when the build is not
+#                current. It restarts T3 Code only when it built something.
+#
+# T3CODE_SKIP_BUILD=1 is what units.sh sets to get the first path.
 skip_build="${T3CODE_SKIP_BUILD:-0}"
 
 if [ "$skip_build" = 1 ]; then
@@ -189,8 +204,26 @@ fi
 
 fi # skip_bootstrap
 
-echo "Building T3 Code from $branch..."
+# The source build takes minutes. Do it only when the worktree moved after the
+# last build, or when a build asset is absent. T3CODE_FORCE_BUILD=1 always does
+# the build.
+head_sha="$(git -C "$repo_dir" rev-parse --short HEAD)"
+built_sha="$(cat "$state_dir/built-sha" 2>/dev/null || true)"
+build_current=0
+if [ "${T3CODE_FORCE_BUILD:-0}" != 1 ] && [ -n "$built_sha" ] && [ "$head_sha" = "$built_sha" ]; then
+  build_current=1
+  for asset in dist/bin.mjs dist/service-launcher.mjs dist/client/index.html; do
+    [ -f "$repo_dir/apps/server/$asset" ] || build_current=0
+  done
+fi
+
 build_ok=1
+if [ "$build_current" = 1 ]; then
+  # The global install below still runs. It is quick, and it makes sure that
+  # the global t3 command points at this worktree.
+  echo "The build at $head_sha is current. Skipping the source build."
+else
+echo "Building T3 Code from $branch..."
 (
   cd "$repo_dir"
   "$pnpm_bin" install --frozen-lockfile
@@ -206,6 +239,7 @@ build_ok=1
     fi
   fi
 ) || build_ok=0
+fi
 
 if [ "$build_ok" = 1 ]; then
   echo "Installing the source build globally..."
@@ -244,9 +278,15 @@ else
   install -m 0644 "$root/src/t3code-dashboard.mjs" "$app_dir/t3code-dashboard.mjs"
 fi
 
+# A change to the T3 Code unit becomes active at the next restart of T3 Code.
+# This run restarts T3 Code only after a build, so a user who runs units.sh
+# gets a message and chooses the moment.
+service_unit_before="$(cat "$unit_dir/$service_unit" 2>/dev/null || true)"
+
 sed \
   -e "s|@HOME@|$HOME|g" \
   -e "s|@NODE_DIR@|$node_dir|g" \
+  -e "s|@EXTRA_PATH@|$extra_path|g" \
   -e "s|@T3_BIN@|$t3_bin|g" \
   -e "s|@T3_HOME@|$t3_home|g" \
   -e "s|@PORT@|$service_port|g" \
@@ -257,6 +297,7 @@ sed \
   -e "s|@HOME@|$HOME|g" \
   -e "s|@NODE_BIN@|$node_bin|g" \
   -e "s|@NODE_DIR@|$node_dir|g" \
+  -e "s|@EXTRA_PATH@|$extra_path|g" \
   -e "s|@NPM_BIN@|$npm_bin|g" \
   -e "s|@PNPM_BIN@|$pnpm_bin|g" \
   -e "s|@T3_BIN@|$t3_bin|g" \
@@ -277,11 +318,19 @@ sed \
 systemctl --user daemon-reload
 systemctl --user enable "$service_unit" "$dashboard_unit"
 
-# A dashboard-only refresh leaves T3 Code running. Restarting it would drop
-# every connected client and interrupt whatever is running inside it, for a
-# change that cannot affect it.
-if [ "$skip_build" = 1 ]; then
+# Restart T3 Code only when this run made a new build. A restart drops each
+# connected client and stops the work in the console. A run that compiled
+# nothing cannot change T3 Code, so it must not stop it.
+if [ "$skip_build" = 1 ] || [ "${build_current:-0}" = 1 ]; then
+  echo "T3 Code is unchanged; restarting the dashboard only."
   systemctl --user restart "$dashboard_unit"
+  if [ "$service_unit_before" != "$(cat "$unit_dir/$service_unit")" ]; then
+    echo
+    echo "NOTE: $service_unit changed. The change becomes active at the next"
+    echo "      restart of T3 Code. That restart stops your sessions, so do it"
+    echo "      when it suits you:"
+    echo "        systemctl --user restart $service_unit"
+  fi
 else
   systemctl --user restart "$service_unit" "$dashboard_unit"
 fi

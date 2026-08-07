@@ -88,6 +88,60 @@ A top-level visit to `/` shows the dashboard. The frame in that page shows T3
 Code. A client that is not a browser gets T3 Code at `/`. Use `/dashboard` to
 get the dashboard page directly.
 
+## Update one machine
+
+Each path changes one group of parts, and no other part. Thus you always know
+what a command stops.
+
+| Command | It changes | It restarts | It does not |
+| --- | --- | --- | --- |
+| `refresh-dashboard.sh` | the dashboard file | the dashboard | touch T3 Code |
+| `units.sh` | the units, the launcher, the dashboard, the Serve mapping | the dashboard | build, or touch T3 Code |
+| `install.sh` | each of those, and the build when the build is not current | the dashboard, and T3 Code only after a build | move a branch |
+| `update.sh` | the branches, the build | T3 Code | — |
+
+For a usual update after you get new commits:
+
+```bash
+git pull
+T3CODE_INSTANCE=production ./install.sh
+```
+
+Type `production` when the script asks you. This command also does the first
+install on a machine with nothing installed.
+
+`install.sh` builds the source only when the worktree moved after the last
+build, or when a build asset is absent. It restarts T3 Code only when it built
+something. Thus an update that changes the dashboard only takes seconds, and
+your sessions in the console continue.
+
+For a change to a file in `systemd/` or to the dashboard, and for no change to
+T3 Code:
+
+```bash
+T3CODE_INSTANCE=production ./units.sh
+```
+
+A change to the T3 Code unit becomes active at the next restart of T3 Code. The
+script gives you a message, because that restart stops your sessions. Do the
+restart when it suits you:
+
+```bash
+systemctl --user restart t3code.service
+```
+
+### The path of the units
+
+The units give a PATH to T3 Code and to the dashboard. That PATH must contain
+the directory of `mise`, when this machine has `mise`. The npm shim of `mise`
+calls `mise reshim` after a global install. Without `mise` on the path, that
+call fails with code 127. Two operations then fail after a correct install:
+
+- The deploy job in the dashboard.
+- Each update of a provider CLI, for example Codex, in the console.
+
+`install.sh` finds the directory of `mise` and puts it in the units.
+
 ## Update the dashboard
 
 Use this procedure when you change only `src/t3code-dashboard.mjs`. The
@@ -111,20 +165,45 @@ the script. Thus the script cannot stop T3 Code.
 
 ## Update T3 Code
 
-Use this procedure when T3 Code changes. The procedure builds the source again.
-It stops T3 Code for a short time.
-
-To build the local `deploy` branch again:
+`install.sh` builds the `deploy` branch when the build is not current. To do the
+build in all conditions, for example after a failed build:
 
 ```bash
-T3CODE_INSTANCE=production ./install.sh
+T3CODE_FORCE_BUILD=1 T3CODE_INSTANCE=production ./install.sh
 ```
+
+The build stops T3 Code for a short time.
 
 To get the changes from the upstream project first:
 
 ```bash
 T3CODE_INSTANCE=production ./update.sh
 ```
+
+### The dashboard buttons
+
+Each button moves one thing. The arrow gives the direction.
+
+```text
+FORK   main <- upstream    moves main only. It pushes main.
+FORK   deploy <- main      merges main into deploy. It pushes deploy.
+DEV    dev <- deploy       merges deploy into dev. It pushes dev.
+DEV    deploy <- dev       promotes dev to deploy. It pushes deploy.
+BUILD  Build               compiles the source. No install. No restart.
+BUILD  Deploy              installs the build and restarts T3 Code. No compile.
+```
+
+No button builds and merges together. No button merges two pairs of branches
+together.
+
+A full upgrade is these steps, in this sequence:
+
+```text
+main <- upstream   ->   deploy <- main   ->   dev <- deploy   ->   Build   ->   Deploy
+```
+
+Thus a conflict in one step leaves the other branches where they were. You
+repeat one step, and not the full sequence. Only **Deploy** stops your sessions.
 
 `update.sh` gets both remotes. It moves `main` forward to `upstream/main`. It
 looks for conflicts. It merges `main` into `deploy`. It builds the source. It
@@ -437,6 +516,7 @@ T3 Code also writes its messages to this file:
 | `uninstall.sh` | Removes the units of one instance. |
 | `check.sh` | Tests one instance. |
 | `dev.sh` | Runs the dashboard shell with the stub. |
+| `units.sh` | Makes the units and the dashboard current. It does not touch T3 Code. |
 | `AGENTS.md` | The rules for an agent that works here. |
 | `lib/guard.sh` | Protects the production instance. |
 | `src/t3code-dashboard.mjs` | The dashboard and the T3 Code proxy. |

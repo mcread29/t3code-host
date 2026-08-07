@@ -274,6 +274,13 @@ async function forkStatus() {
       : { clean: true, conflicts: [] },
   ])
 
+  // Whether a build exists to deploy. The recorded revision is not the test: a
+  // worktree can hold correct assets and no record, and a deploy of those
+  // assets is correct.
+  const hasBuild = (await Promise.all(BUILD_ASSETS.map((asset) =>
+    readFile(`${REPO}/apps/server/${asset}`).then(() => true).catch(() => false),
+  ))).every(Boolean)
+
   const tip = await gitOrNull('rev-parse', '--short', BRANCH)
   const conflicts = [...new Set([...syncPreview.conflicts, ...deployPreview.conflicts, ...devPreview.conflicts])]
 
@@ -284,6 +291,7 @@ async function forkStatus() {
     head,
     tip,
     built,
+    hasBuild,
     needsRebuild: Boolean(tip && built && tip !== built),
     dirty: Boolean(dirty),
     mainBehind: Number(mainBehind ?? 0),
@@ -600,7 +608,12 @@ const DEV_SESSION_FILE = `${STATE_DIR}/proxy-session-dev`
 const sessionTokens = new Map()
 
 async function mintSessionToken(home) {
-  const args = ['auth', 'session', 'issue', '--ttl', '30d', '--label', 'dashboard proxy', '--token-only']
+  // The label includes the port. T3 Code revokes the session that has the same
+  // label when it issues a new one. With a constant label, a second dashboard
+  // on this machine removes the session of the first dashboard, and the console
+  // of the first dashboard then gets an HTTP 403.
+  const label = `dashboard proxy :${PORT}`
+  const args = ['auth', 'session', 'issue', '--ttl', '30d', '--label', label, '--token-only']
   if (home) args.push('--base-dir', home)
   const { stdout } = await run(T3_BIN, args, { timeout: 30_000 })
   const token = stripAnsi(stdout).trim().split('\n').filter(Boolean).pop()?.trim()
@@ -888,15 +901,6 @@ const BUILD_STEPS = [
       appendOutput(job, `ok ${asset}\n`)
     }
   }),
-]
-
-// Installing and restarting are deliberately after every build step: a failed
-// build leaves the running service exactly as it was.
-const DEPLOY_STEPS = [
-  step('install globally', (job) => exec(job, NPM_BIN, npmInstallArgs(`${REPO}/apps/server`))),
-  step('restart service', (job) =>
-    exec(job, 'systemctl', ['--user', 'restart', UNIT], { cwd: process.env.HOME }),
-  ),
   step('record built revision', async (job) => {
     const sha = await git('rev-parse', '--short', 'HEAD')
     await mkdir(STATE_DIR, { recursive: true })
@@ -905,46 +909,72 @@ const DEPLOY_STEPS = [
   }),
 ]
 
-const SYNC_STEPS = [
-  step('fetch', (job) => exec(job, 'git', ['-C', REPO, 'fetch', '--prune', '--multiple', 'origin', 'upstream'])),
-  step('guard deploy worktree', async (job) => {
-    if (await git('status', '--porcelain')) {
-      throw new Error(`${BRANCH} worktree has uncommitted changes`)
+// Installing and restarting are deliberately after every build step: a failed
+// build leaves the running service exactly as it was.
+// Installing and restarting are deliberately separate from the build. A deploy
+// makes the assets in the worktree live. It compiles nothing, and it moves no
+// branch.
+const DEPLOY_STEPS = [
+  step('verify a build is present', async (job) => {
+    for (const asset of BUILD_ASSETS) {
+      await readFile(`${REPO}/apps/server/${asset}`).catch(() => {
+        throw new Error(`no build to deploy: apps/server/${asset} is absent. Build first.`)
+      })
     }
-    const checkedOut = await git('rev-parse', '--abbrev-ref', 'HEAD')
-    if (checkedOut !== BRANCH) throw new Error(`deploy worktree must have ${BRANCH} checked out`)
-    appendOutput(job, `${BRANCH} worktree clean\n`)
+    appendOutput(job, 'build assets present\n')
   }),
-  // main is a pure mirror of upstream, so a non-fast-forward here means
-  // something rewrote it locally and a human should look.
-  step('sync main from upstream', async (job) => {
+  step('install globally', (job) => exec(job, NPM_BIN, npmInstallArgs(`${REPO}/apps/server`))),
+  step('restart service', (job) =>
+    exec(job, 'systemctl', ['--user', 'restart', UNIT], { cwd: process.env.HOME }),
+  ),
+]
+
+// One merge for each pair of branches, and nothing else in the job. Thus a
+// conflict between main and deploy leaves dev where it was, and you repeat one
+// step and not three.
+const guardDeploy = step('guard deploy worktree', async (job) => {
+  if (await git('status', '--porcelain')) {
+    throw new Error(`${BRANCH} worktree has uncommitted changes`)
+  }
+  const checkedOut = await git('rev-parse', '--abbrev-ref', 'HEAD')
+  if (checkedOut !== BRANCH) throw new Error(`deploy worktree must have ${BRANCH} checked out`)
+  appendOutput(job, `${BRANCH} worktree clean\n`)
+})
+
+const guardDev = step('guard development worktree', async (job) => {
+  if (!DEV_REPO || DEV_REPO === REPO) throw new Error('there is no separate development worktree')
+  if (await gitIn(DEV_REPO, 'status', '--porcelain')) {
+    throw new Error(`${DEV_BRANCH} worktree has uncommitted changes`)
+  }
+  appendOutput(job, `${DEV_BRANCH} worktree clean\n`)
+})
+
+// main is a copy of upstream. A merge that is not a fast-forward means that
+// something changed main on this machine, and a person must look at it.
+const MAIN_STEPS = [
+  step('fetch', (job) => exec(job, 'git', ['-C', REPO, 'fetch', '--prune', '--multiple', 'origin', 'upstream'])),
+  step('move main to upstream/main', async (job) => {
     await exec(job, 'git', ['-C', REPO, 'merge-base', '--is-ancestor', 'main', 'upstream/main'])
     await exec(job, 'git', ['-C', REPO, 'branch', '-f', 'main', 'upstream/main'])
-    await exec(job, 'git', ['-C', REPO, 'push', 'origin', 'main'])
   }),
+  step('push main', async (job) => {
+    const pushed = await gitOrNull('push', 'origin', 'main')
+    appendOutput(job, pushed === null ? '[skipped] could not push main\n' : 'pushed main\n')
+  }),
+]
+
+const MERGE_DEPLOY_STEPS = [
+  guardDeploy,
   step(`merge main into ${BRANCH}`, (job) => mergeInto(job, REPO, 'main', BRANCH)),
-  // If deploy moves forward and dev does not, the two branches become
-  // different. Thus this step moves dev forward in the same run. A conflict
-  // here is not fatal. The deployed build stays correct. You correct dev by
-  // hand.
-  step(`merge ${BRANCH} into ${DEV_BRANCH}`, async (job) => {
-    if (!DEV_REPO || DEV_REPO === REPO) {
-      appendOutput(job, 'no separate development worktree; skipped\n')
-      return
-    }
-    if (await gitIn(DEV_REPO, 'status', '--porcelain')) {
-      appendOutput(job, `[skipped] ${DEV_BRANCH} worktree has uncommitted changes\n`)
-      return
-    }
-    try {
-      await mergeInto(job, DEV_REPO, BRANCH, DEV_BRANCH)
-      // The branch can have no upstream. A push failure here must not fail a
-      // deploy that is complete.
-      const pushed = await gitInOrNull(DEV_REPO, 'push', 'origin', DEV_BRANCH)
-      appendOutput(job, pushed === null ? `[skipped] could not push ${DEV_BRANCH}\n` : `pushed ${DEV_BRANCH}\n`)
-    } catch (err) {
-      appendOutput(job, `[skipped] ${err.message}\n`)
-    }
+  step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
+]
+
+const MERGE_DEV_STEPS = [
+  guardDev,
+  step(`merge ${BRANCH} into ${DEV_BRANCH}`, (job) => mergeInto(job, DEV_REPO, BRANCH, DEV_BRANCH)),
+  step(`push ${DEV_BRANCH}`, async (job) => {
+    const pushed = await gitInOrNull(DEV_REPO, 'push', 'origin', DEV_BRANCH)
+    appendOutput(job, pushed === null ? `[skipped] could not push ${DEV_BRANCH}\n` : `pushed ${DEV_BRANCH}\n`)
   }),
 ]
 
@@ -970,27 +1000,31 @@ async function mergeInto(job, worktree, from, into) {
 // ancestor of dev. Thus a promotion is usually a fast-forward. The build then
 // contains the same commit that you tested on the dev runner.
 const PROMOTE_STEPS = [
-  step('guard worktrees', async (job) => {
-    if (await git('status', '--porcelain')) throw new Error(`${BRANCH} worktree has uncommitted changes`)
-    if (!DEV_REPO) throw new Error('T3CODE_DEV_REPO is not configured')
-    if (await gitIn(DEV_REPO, 'status', '--porcelain')) {
-      throw new Error(`${DEV_BRANCH} worktree has uncommitted changes`)
-    }
-    const checkedOut = await git('rev-parse', '--abbrev-ref', 'HEAD')
-    if (checkedOut !== BRANCH) throw new Error(`deploy worktree must have ${BRANCH} checked out`)
-    appendOutput(job, 'deploy and development worktrees clean\n')
-  }),
-  step(`promote ${DEV_BRANCH} to ${BRANCH}`, (job) => mergeInto(job, REPO, DEV_BRANCH, BRANCH)),
-]
-
-const PUSH_STEP = [
+  guardDeploy,
+  guardDev,
+  step(`merge ${DEV_BRANCH} into ${BRANCH}`, (job) => mergeInto(job, REPO, DEV_BRANCH, BRANCH)),
   step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
 ]
 
+// One job moves one thing. Thus you always know what a button changes, and a
+// failure gives you one step to repeat.
+//
+//   main           main <- upstream/main. No merge into another branch.
+//   merge-deploy   deploy <- main. No build. No restart.
+//   merge-dev      dev <- deploy. No build. No restart.
+//   promote        deploy <- dev. No build. No restart.
+//   build          the source only. No install. No restart.
+//   deploy         the installation and the service only. No git. No compile.
+//
+// A full upgrade is main, merge-deploy, merge-dev, build, deploy. Each job is
+// separate, so a conflict in one leaves the other branches where they were.
 const JOBS = {
-  'sync-build-deploy': [...SYNC_STEPS, ...BUILD_STEPS, ...DEPLOY_STEPS, ...PUSH_STEP],
-  'promote-dev': [...PROMOTE_STEPS, ...BUILD_STEPS, ...DEPLOY_STEPS, ...PUSH_STEP],
-  rebuild: [...BUILD_STEPS, ...DEPLOY_STEPS],
+  main: [...MAIN_STEPS],
+  'merge-deploy': [...MERGE_DEPLOY_STEPS],
+  'merge-dev': [...MERGE_DEV_STEPS],
+  promote: [...PROMOTE_STEPS],
+  build: [...BUILD_STEPS],
+  deploy: [...DEPLOY_STEPS],
 }
 
 function startJob(name) {
@@ -1569,8 +1603,11 @@ const PAGE = String.raw`<!doctype html>
         </h2>
         <div class="chips" id="fork-chips"></div>
         <div id="fork-note" class="note"></div>
+        <!-- One button for each merge. The arrow gives the direction, so the
+             label states what moves and where it goes. -->
         <div class="actions" style="margin-top:.7rem">
-          <button id="fork-deploy" class="primary">Sync, build &amp; deploy</button>
+          <button id="job-main">main &larr; upstream</button>
+          <button id="job-merge-deploy" class="primary">deploy &larr; main</button>
         </div>
         <!-- Not a <details>: that element slots its content into a UA shadow
              tree, so the body is not a flex child of it and cannot be given
@@ -1592,8 +1629,11 @@ const PAGE = String.raw`<!doctype html>
         <dl id="fork-dev-status"></dl>
         <div id="fork-dev-note" class="note"></div>
         <div class="actions" style="margin-top:.7rem">
+          <button id="job-merge-dev">dev &larr; deploy</button>
+          <button id="fork-promote">deploy &larr; dev</button>
+        </div>
+        <div class="actions" style="margin-top:.45rem">
           <button id="dev-runner-toggle">Start dev server</button>
-          <button id="fork-promote">Promote to deploy</button>
         </div>
         <div id="dev-runner-note" class="muted" style="margin-top:.55rem"></div>
       </section>
@@ -1602,7 +1642,8 @@ const PAGE = String.raw`<!doctype html>
         <h2>build</h2>
         <dl id="fork-build-status"></dl>
         <div class="actions" style="margin-top:.7rem">
-          <button id="fork-rebuild">Rebuild</button>
+          <button id="build-run">Build</button>
+          <button id="build-deploy" class="primary">Deploy</button>
         </div>
       </section>
 
@@ -1999,27 +2040,35 @@ function renderFork(f) {
 
   const pending = f.mainBehind > 0 || f.deployBehind > 0
   const blocked = f.dirty || !f.clean || !managed
-  $('fork-deploy').disabled = blocked || !pending || Boolean(f.active)
-  $('fork-promote').disabled = !managed || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0 || Boolean(f.active)
-  $('fork-rebuild').disabled = !managed || f.dirty || Boolean(f.active)
+  // Each button states only its own conditions. A sync and a promote move
+  // branches, so they need clean worktrees but no systemd unit. A deploy
+  // restarts the service, so it needs the unit but no clean worktree.
+  const busy = Boolean(f.active)
+  const hasDev = Boolean(f.dev.repo && f.dev.repo !== f.repo)
+  $('job-main').disabled = busy || f.mainBehind === 0
+  $('job-merge-deploy').disabled = busy || f.dirty || !f.clean || f.deployBehind === 0
+  $('job-merge-dev').disabled = busy || !hasDev || f.dev.dirty || f.dev.behind === 0
+  $('fork-promote').disabled = busy || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0
+  $('build-run').disabled = busy || f.dirty
+  $('build-deploy').disabled = busy || !managed || !f.hasBuild
 
   $('fork-note').innerHTML = f.dirty
     ? 'Worktree has uncommitted changes. Resolve them in ' + esc(f.repo) + ' first.'
     : !f.clean
       ? '<span class="bad-text">Conflicts — merge by hand:</span> ' + esc(f.conflicts.join(', '))
       : pending
-        ? f.mainBehind + ' upstream commit(s) ready to merge and deploy.'
+        ? f.mainBehind + ' upstream commit(s) to merge. Move main, then deploy, then dev.'
         : f.needsRebuild
-          ? 'Up to date with upstream, but the deployed build is older than the branch tip.'
-          : 'Up to date with upstream.'
+          ? 'The branches agree with upstream. The build is older than the branch tip. Build, then deploy.'
+          : 'The branches agree with upstream.'
 
   $('fork-dev-note').innerHTML = f.dev.dirty
     ? 'Development changes are safe in ' + esc(f.dev.repo) + '. Commit them before merging into ' + esc(f.branch) + '.'
     : !f.dev.clean
       ? '<span class="bad-text">Dev merge conflicts — resolve in the dev worktree:</span> ' + esc(f.dev.conflicts.join(', '))
       : f.dev.ahead > 0
-        ? f.dev.ahead + ' committed dev change(s) ready to promote.'
-        : 'Nothing to promote; dev matches ' + esc(f.branch) + '.'
+        ? f.dev.ahead + ' committed dev change(s) to promote. The promotion moves the branch only.'
+        : 'Nothing to promote. Dev agrees with ' + esc(f.branch) + '.'
 
   const box = $('fork-commits')
   box.innerHTML = f.commits.length
@@ -2106,10 +2155,14 @@ function pollJob(id) {
   }, 1000)
 }
 
+// Every job button, so a running job disables all of them and the page cannot
+// start a second job on the same repository.
+const JOB_BUTTONS = [
+  'job-main', 'job-merge-deploy', 'job-merge-dev', 'fork-promote', 'build-run', 'build-deploy',
+]
+
 async function startJob(name) {
-  $('fork-deploy').disabled = true
-  $('fork-promote').disabled = true
-  $('fork-rebuild').disabled = true
+  for (const id of JOB_BUTTONS) $(id).disabled = true
   try {
     const res = await fetch('/_dash/job?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
     const r = await res.json()
@@ -2121,17 +2174,38 @@ async function startJob(name) {
   }
 }
 
-$('fork-deploy').onclick = () => {
-  if (confirm('Merge upstream into deploy and deploy into dev, rebuild, and restart the service?')) {
-    startJob('sync-build-deploy')
+// Each message names what the job changes, and what it does not change. Only
+// the deploy stops T3 Code, so only its message gives that warning.
+// Each message names the one branch that moves. Only the deploy stops T3 Code,
+// so only its message gives that warning.
+$('job-main').onclick = () => {
+  if (confirm('Move main to upstream/main, and push main. No other branch changes.')) {
+    startJob('main')
   }
 }
-$('fork-rebuild').onclick = () => {
-  if (confirm('Rebuild from the current branch and restart the service?')) startJob('rebuild')
+$('job-merge-deploy').onclick = () => {
+  if (confirm('Merge main into deploy, and push deploy. This builds nothing and restarts nothing.')) {
+    startJob('merge-deploy')
+  }
+}
+$('job-merge-dev').onclick = () => {
+  if (confirm('Merge deploy into dev, and push dev. This builds nothing and restarts nothing.')) {
+    startJob('merge-dev')
+  }
 }
 $('fork-promote').onclick = () => {
-  if (confirm('Promote dev to deploy, rebuild, and restart the service?')) {
-    startJob('promote-dev')
+  if (confirm('Merge dev into deploy, and push deploy. This builds nothing and restarts nothing.')) {
+    startJob('promote')
+  }
+}
+$('build-run').onclick = () => {
+  if (confirm('Build the current branch from the source. This changes no branch, and the running service stays as it is.')) {
+    startJob('build')
+  }
+}
+$('build-deploy').onclick = () => {
+  if (confirm('Install the current build and restart T3 Code. This stops your sessions for a short time. It compiles nothing.')) {
+    startJob('deploy')
   }
 }
 

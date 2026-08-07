@@ -2370,6 +2370,11 @@ async function loadFrame() {
   showPlaceholder('loading T3 Code…', location.origin, false)
   $('frame').addEventListener('load', showFrame, { once: true })
   $('frame').src = '/?embed=1'
+  // Do not wait for the frame's load event: a dev-mode console pulls hundreds
+  // of unbundled modules through the proxy chain, so that event can be minutes
+  // away while the page is already rendering. Show the document once it has
+  // had a moment to commit and let it finish loading in view.
+  setTimeout(showFrame, 2000)
 }
 
 // ?embed=1 makes the root serve the console rather than this page. Only the

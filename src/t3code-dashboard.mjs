@@ -1114,6 +1114,9 @@ const SELF_UPDATE_STEPS = [
     await exec(job, 'systemd-run', [
       '--user', '--collect',
       '--unit', `${DASH_UNIT.replace(/\.service$/, '')}-refresh`,
+      // A transient unit starts with a bare environment; the script needs the
+      // same node and git this dashboard was started with.
+      '--setenv', `PATH=${process.env.PATH}`,
       '--setenv', `T3CODE_INSTANCE=${INSTANCE}`,
       '--setenv', 'T3CODE_YES=1',
       `${HOST_REPO}/refresh-dashboard.sh`,

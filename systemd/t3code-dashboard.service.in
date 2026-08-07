@@ -25,6 +25,10 @@ Environment=T3CODE_REPO=@REPO@
 Environment=T3CODE_DEV_REPO=@DEV_REPO@
 Environment=T3CODE_BRANCH=@BRANCH@
 Environment=T3CODE_DEV_BRANCH=@DEV_BRANCH@
+# The dashboard's own source, so it can report and pull its own updates.
+Environment=T3CODE_HOST_REPO=@HOST_REPO@
+Environment=T3CODE_DASH_UNIT=@DASHBOARD_UNIT@
+Environment=T3CODE_INSTANCE=@INSTANCE@
 ExecStart=@NODE_BIN@ @APP_DIR@/t3code-dashboard.mjs
 Restart=always
 RestartSec=5

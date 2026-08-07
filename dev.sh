@@ -15,6 +15,7 @@
 # stops the script.
 #
 #   ./dev.sh          run the dashboard with the stub
+#   ./dev.sh --mock   canned dashboard states, with a scenario picker
 #   ./dev.sh check    test the instance
 #   ./dev.sh down     remove an installed dev instance
 set -euo pipefail
@@ -26,9 +27,13 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --dash-only is the only behaviour now. The script accepts the option, because
 # you can continue to type it.
 args=()
+mock="${T3CODE_MOCK:-}"
 for arg in "$@"; do
   case "$arg" in
     --dash-only) ;;
+    # Canned dashboard states with a scenario picker, in place of real git,
+    # systemd, and npm data. For working on the page itself.
+    --mock) mock=1 ;;
     *) args+=("$arg") ;;
   esac
 done
@@ -39,6 +44,8 @@ prod_app_dir="${T3CODE_PROD_APP_DIR:-${HOME}/.local/share/t3code-host}"
 
 repo_dir="${T3CODE_REPO:-$prod_app_dir/dev}"
 branch="${T3CODE_BRANCH:-dev}"
+dev_repo="${T3CODE_DEV_REPO:-}"
+dev_branch="${T3CODE_DEV_BRANCH:-dev}"
 dash_port="${T3CODE_TEST_DASH_PORT:-5124}"
 
 # Development must never use the instance or the ports of production. This
@@ -133,10 +140,12 @@ case "$command_name" in
       T3CODE_HOME="$stub_home" \
       T3CODE_STATE_DIR="$stub_home/dashboard-state" \
       T3CODE_UNIT= \
+      T3CODE_MOCK="$mock" \
+      T3CODE_HOST_REPO="$root" \
       T3CODE_REPO="$repo_dir" \
-      T3CODE_DEV_REPO= \
+      T3CODE_DEV_REPO="$dev_repo" \
       T3CODE_BRANCH="$branch" \
-      T3CODE_DEV_BRANCH="$branch" \
+      T3CODE_DEV_BRANCH="$dev_branch" \
       setsid node --watch "$root/src/t3code-dashboard.mjs" &
     dashboard_pid=$!
 

@@ -313,6 +313,9 @@ sed \
   -e "s|@DEV_REPO@|$dev_dir|g" \
   -e "s|@BRANCH@|$branch|g" \
   -e "s|@DEV_BRANCH@|$dev_branch|g" \
+  -e "s|@HOST_REPO@|$root|g" \
+  -e "s|@DASHBOARD_UNIT@|$dashboard_unit|g" \
+  -e "s|@INSTANCE@|$instance|g" \
   "$root/systemd/t3code-dashboard.service.in" >"$unit_dir/$dashboard_unit"
 
 systemctl --user daemon-reload
@@ -333,6 +336,7 @@ if [ "$skip_build" = 1 ] || [ "${build_current:-0}" = 1 ]; then
   fi
 else
   systemctl --user restart "$service_unit" "$dashboard_unit"
+  cp "$state_dir/built-sha" "$state_dir/deployed-sha"
 fi
 
 host="$(tailscale ip -4 | head -n1)"

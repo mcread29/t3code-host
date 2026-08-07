@@ -35,6 +35,7 @@ const DEV_REPO = process.env.T3CODE_DEV_REPO ?? ''
 const DEV_BRANCH = process.env.T3CODE_DEV_BRANCH ?? 'dev'
 const STATE_DIR = process.env.T3CODE_STATE_DIR ?? `${process.env.HOME}/.local/state/t3code-host`
 const BUILT_SHA_PATH = `${STATE_DIR}/built-sha`
+const DEPLOYED_SHA_PATH = `${STATE_DIR}/deployed-sha`
 const T3_HOME = process.env.T3CODE_HOME ?? `${process.env.HOME}/.t3`
 
 // Serving the page already requires being on the tailnet; this token only
@@ -244,16 +245,25 @@ async function builtSha() {
   }
 }
 
+async function deployedSha() {
+  try {
+    return (await readFile(DEPLOYED_SHA_PATH, 'utf8')).trim() || null
+  } catch {
+    return null
+  }
+}
+
 async function forkStatus() {
   if (!REPO) return null
 
-  const [branch, head, dirty, mainBehind, deployBehind, built, devHead, devDirty, devAhead, devBehind] = await Promise.all([
+  const [branch, head, dirty, mainBehind, deployBehind, built, deployed, devHead, devDirty, devAhead, devBehind] = await Promise.all([
     gitOrNull('rev-parse', '--abbrev-ref', 'HEAD'),
     gitOrNull('rev-parse', '--short', 'HEAD'),
     gitOrNull('status', '--porcelain'),
     gitOrNull('rev-list', '--count', 'main..upstream/main'),
     gitOrNull('rev-list', '--count', `${BRANCH}..main`),
     builtSha(),
+    deployedSha(),
     DEV_REPO ? gitIn(DEV_REPO, 'rev-parse', '--short', 'HEAD').catch(() => null) : null,
     DEV_REPO ? gitIn(DEV_REPO, 'status', '--porcelain').catch(() => null) : null,
     gitOrNull('rev-list', '--count', `${BRANCH}..${DEV_BRANCH}`),
@@ -291,8 +301,10 @@ async function forkStatus() {
     head,
     tip,
     built,
+    deployed,
     hasBuild,
-    needsRebuild: Boolean(tip && built && tip !== built),
+    needsRebuild: Boolean(tip && (tip !== built || !hasBuild)),
+    needsDeploy: Boolean(hasBuild && built && built !== deployed),
     dirty: Boolean(dirty),
     mainBehind: Number(mainBehind ?? 0),
     deployBehind: Number(deployBehind ?? 0),
@@ -308,6 +320,64 @@ async function forkStatus() {
     },
     clean: syncPreview.clean && deployPreview.clean,
     conflicts,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// the dashboard's own source
+// ---------------------------------------------------------------------------
+
+// The host repo this dashboard is built from. The installed dashboard is a
+// copy of src/t3code-dashboard.mjs, so it can watch its own repo and replace
+// itself without touching T3 Code.
+const HOST_REPO = process.env.T3CODE_HOST_REPO ?? ''
+const DASH_UNIT = process.env.T3CODE_DASH_UNIT ?? ''
+const INSTANCE = process.env.T3CODE_INSTANCE ?? 'production'
+
+async function gitHostOrNull(...args) {
+  try {
+    const { stdout } = await run('git', ['-C', HOST_REPO, ...args], {
+      timeout: 60_000, maxBuffer: 8 * 1024 * 1024,
+    })
+    return stdout.trim()
+  } catch {
+    return null
+  }
+}
+
+// New commits are not the only way to be stale: the installed dashboard is a
+// copy, so the repo can be ahead of the running file with no commits pending.
+// Equal files also mean an update would change nothing.
+async function selfCopyCurrent() {
+  try {
+    const [running, source] = await Promise.all([
+      readFile(process.argv[1], 'utf8'),
+      readFile(`${HOST_REPO}/src/t3code-dashboard.mjs`, 'utf8'),
+    ])
+    return running === source
+  } catch {
+    return null
+  }
+}
+
+async function selfStatus() {
+  if (!HOST_REPO) return null
+  const [branch, head, dirty, behind, log, copyCurrent] = await Promise.all([
+    gitHostOrNull('rev-parse', '--abbrev-ref', 'HEAD'),
+    gitHostOrNull('rev-parse', '--short', 'HEAD'),
+    gitHostOrNull('status', '--porcelain'),
+    gitHostOrNull('rev-list', '--count', 'HEAD..@{upstream}'),
+    gitHostOrNull('log', '--oneline', '--no-decorate', '-30', 'HEAD..@{upstream}'),
+    selfCopyCurrent(),
+  ])
+  return {
+    repo: HOST_REPO, branch, head,
+    dirty: Boolean(dirty),
+    behind: Number(behind ?? 0),
+    commits: log ? log.split('\n').filter(Boolean) : [],
+    copyCurrent,
+    managed: Boolean(DASH_UNIT),
+    active: activeJob && jobs.get(activeJob)?.state === 'running' ? activeJob : null,
   }
 }
 
@@ -927,6 +997,13 @@ const DEPLOY_STEPS = [
   step('restart service', (job) =>
     exec(job, 'systemctl', ['--user', 'restart', UNIT], { cwd: process.env.HOME }),
   ),
+  step('record deployed revision', async (job) => {
+    const sha = await builtSha()
+    if (!sha) throw new Error('the build revision is not recorded. Build first.')
+    await mkdir(STATE_DIR, { recursive: true })
+    await writeFile(DEPLOYED_SHA_PATH, `${sha}\n`)
+    appendOutput(job, `deployed ${sha}\n`)
+  }),
 ]
 
 // One merge for each pair of branches, and nothing else in the job. Thus a
@@ -1006,6 +1083,34 @@ const PROMOTE_STEPS = [
   step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
 ]
 
+// The dashboard updating itself. The pull is ours; the copy-and-restart is
+// refresh-dashboard.sh's, handed to systemd so it survives the restart of the
+// very process that started it. It never names the T3 Code unit.
+const SELF_UPDATE_STEPS = [
+  step('guard dashboard repo', async (job) => {
+    if (await gitHostOrNull('status', '--porcelain')) {
+      throw new Error(`the dashboard repo has uncommitted changes: ${HOST_REPO}`)
+    }
+    appendOutput(job, 'dashboard repo clean\n')
+  }),
+  step('pull latest', (job) =>
+    exec(job, 'git', ['-C', HOST_REPO, 'pull', '--ff-only'], { cwd: HOST_REPO })),
+  step('install and restart dashboard', async (job) => {
+    if (!DASH_UNIT) {
+      appendOutput(job, '[skipped] no dashboard unit; this instance runs from source. Restart it to apply.\n')
+      return
+    }
+    await exec(job, 'systemd-run', [
+      '--user', '--collect',
+      '--unit', `${DASH_UNIT.replace(/\.service$/, '')}-refresh`,
+      '--setenv', `T3CODE_INSTANCE=${INSTANCE}`,
+      '--setenv', 'T3CODE_YES=1',
+      `${HOST_REPO}/refresh-dashboard.sh`,
+    ], { cwd: HOST_REPO })
+    appendOutput(job, 'refresh handed to systemd; the dashboard restarts in a moment\n')
+  }),
+]
+
 // One job moves one thing. Thus you always know what a button changes, and a
 // failure gives you one step to repeat.
 //
@@ -1025,12 +1130,16 @@ const JOBS = {
   promote: [...PROMOTE_STEPS],
   build: [...BUILD_STEPS],
   deploy: [...DEPLOY_STEPS],
+  'self-update': [...SELF_UPDATE_STEPS],
 }
 
 function startJob(name) {
   const steps = JOBS[name]
   if (!steps) throw new Error(`unknown job: ${name}`)
-  if (!REPO) throw new Error('T3CODE_REPO is not configured')
+  if (name === 'self-update' ? !HOST_REPO : !REPO) {
+    throw new Error(name === 'self-update'
+      ? 'T3CODE_HOST_REPO is not configured' : 'T3CODE_REPO is not configured')
+  }
   if (activeJob && jobs.get(activeJob)?.state === 'running') {
     const err = new Error('a job is already running')
     err.conflict = true
@@ -1079,6 +1188,233 @@ const ACTIONS = {
   },
 }
 
+// ---------------------------------------------------------------------------
+// mock mode
+// ---------------------------------------------------------------------------
+
+// T3CODE_MOCK=1 replaces every /_dash data source with canned states, so each
+// screen of the page can be seen and styled without a clone, a build, or a
+// systemd unit. A picker in the console header switches the scenario. The
+// proxy is untouched: the frame still shows whatever the proxy origin serves.
+const MOCK = process.env.T3CODE_MOCK === '1'
+
+const MOCK_COMMITS = [
+  '9f3c2a1 feat(agent): stream tool output into the session view',
+  '4d81be0 fix(server): close the websocket on session expiry',
+  '7aa90c4 chore: bump vite to 6.3.2',
+  '02cd511 fix(web): keep the sidebar scroll position on refresh',
+]
+
+// One object per state the page can be in. `fork` overrides the healthy fork,
+// `status` overrides the healthy service, `jobOutcome: 'failed'` makes the
+// next job fail partway, and `npm: true` hides the fork entirely so the page
+// falls back to the npm release sections.
+const MOCK_SCENARIOS = {
+  synced: {},
+  'upstream-behind': { fork: { mainBehind: 4, commits: MOCK_COMMITS } },
+  'merge-pending': { fork: { deployBehind: 2 } },
+  'build-stale': { fork: { tip: 'ef45ab1', needsRebuild: true } },
+  deployable: { fork: { tip: 'ef45ab1', built: 'ef45ab1', needsDeploy: true } },
+  'dev-ahead': { fork: { dev: { ahead: 3 } } },
+  'dev-behind': { fork: { dev: { behind: 2 } } },
+  conflicts: {
+    fork: {
+      mainBehind: 2, clean: false, commits: MOCK_COMMITS.slice(0, 2),
+      conflicts: ['apps/server/src/router.ts', 'packages/core/src/auth.ts'],
+    },
+  },
+  dirty: { fork: { dirty: true, dev: { dirty: true } } },
+  'job-fails': { fork: { tip: 'ef45ab1', needsRebuild: true }, jobOutcome: 'failed' },
+  'service-stopped': { status: { active: 'inactive', sub: 'dead', pid: null, startedAt: null, origin: null } },
+  'service-failed': { status: { active: 'failed', sub: 'failed', pid: null, startedAt: null, origin: null, restarts: '4' } },
+  'dashboard-behind': { self: { behind: 2 } },
+  'npm-mode': {
+    npm: true,
+    latest: { installed: '0.0.32-nightly.20260801.990', latest: '0.0.33-nightly.20260806.1010', upToDate: false },
+  },
+}
+
+const mockState = { scenario: 'synced', service: 'active', runner: 'stopped', job: null }
+const mockJobs = new Map()
+
+function mockScenario() {
+  return MOCK_SCENARIOS[mockState.scenario] ?? {}
+}
+
+function mockFork() {
+  const { dev = {}, ...rest } = mockScenario().fork ?? {}
+  const commits = rest.commits ?? []
+  return {
+    repo: '/mock/t3code/src', branch: 'deploy', checkedOut: 'deploy',
+    head: 'ab12cd3', tip: 'ab12cd3', built: 'ab12cd3', deployed: 'ab12cd3',
+    hasBuild: true, needsRebuild: false, needsDeploy: false, dirty: false,
+    mainBehind: 0, deployBehind: 0, clean: true, conflicts: [],
+    ...rest,
+    commits,
+    dev: {
+      repo: '/mock/t3code/dev', branch: 'dev', head: 'ab12cd3',
+      dirty: false, ahead: 0, behind: 0, clean: true, conflicts: [],
+      ...dev,
+    },
+    active: mockState.job?.state === 'running' ? mockState.job.id : null,
+  }
+}
+
+function mockStatus() {
+  const stopped = mockState.service !== 'active'
+  return {
+    managed: true, unit: 't3code.service',
+    active: mockState.service, sub: stopped ? 'dead' : 'running',
+    enabled: 'enabled', pid: stopped ? null : '41214',
+    startedAt: stopped ? null : new Date(Date.now() - 2 * 3600_000).toString(),
+    restarts: '0',
+    installed: '0.0.32-nightly.20260801.990',
+    url: null,
+    origin: stopped ? null : PROXY_ORIGIN || 'http://localhost:4123',
+    ...mockScenario().status,
+  }
+}
+
+function mockRunnerStatus() {
+  return {
+    configured: true, repo: '/mock/t3code/dev', branch: 'dev',
+    state: mockState.runner,
+    origin: mockState.runner === 'running' ? 'http://localhost:1' : null,
+    error: null, output: '',
+  }
+}
+
+// A fake job streams output on a timer and walks the real step labels, so the
+// polling, the running marker, and the failure colours all exercise the same
+// paths a real build does -- just in seconds instead of minutes.
+function startMockJob(name) {
+  if (mockState.job?.state === 'running') {
+    const err = new Error('a job is already running')
+    err.conflict = true
+    throw err
+  }
+  const labels = (JOBS[name] ?? []).map((s) => s.label)
+  if (!labels.length) throw new Error(`unknown job: ${name}`)
+  const outcome = mockScenario().jobOutcome ?? 'ok'
+
+  const id = randomBytes(4).toString('hex')
+  const job = { id, name, state: 'running', step: labels[0], output: '', error: null }
+  mockJobs.set(id, job)
+  mockState.job = job
+
+  let tick = 0
+  const timer = setInterval(() => {
+    job.output += `[mock] ${job.step}: line ${tick % 3 + 1}\n`
+    tick++
+    if (tick % 3 !== 0) return
+    const next = labels[tick / 3]
+    if (next && !(outcome === 'failed' && tick / 3 >= Math.min(2, labels.length - 1))) {
+      job.step = next
+      job.output += `\n=== ${next} ===\n`
+      return
+    }
+    clearInterval(timer)
+    if (outcome === 'failed') {
+      job.state = 'failed'
+      job.error = `${job.step} exited 1 (mock)`
+      job.output += `\nFAILED: ${job.error}\n`
+    } else {
+      job.state = 'ok'
+      job.step = 'done'
+      job.output += '\ndone\n'
+    }
+  }, 400)
+  return job
+}
+
+function mockChangelog() {
+  const scen = mockScenario().latest ?? {}
+  return {
+    from: scen.installed ?? '0.0.32-nightly.20260801.990',
+    to: scen.latest ?? '0.0.33-nightly.20260806.1010',
+    releases: [{
+      version: scen.latest ?? '0.0.33-nightly.20260806.1010',
+      name: 'nightly', url: '#',
+      published: new Date(Date.now() - 8 * 3600_000).toISOString(),
+      body: "## What's Changed\n* feat(agent): stream tool output by @mock in https://example.invalid/pull/101\n* fix(server): close the websocket on session expiry by @mock in https://example.invalid/pull/102",
+      build: 1010,
+    }],
+  }
+}
+
+function mockApi(req, res, url) {
+  const post = req.method === 'POST'
+  if (post && req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
+  const path = url.pathname
+
+  if (path === '/_dash/mock') {
+    if (post) {
+      const wanted = url.searchParams.get('scenario')
+      if (!MOCK_SCENARIOS[wanted]) return json(res, 400, { error: `unknown scenario: ${wanted}` })
+      mockState.scenario = wanted
+      mockState.service = MOCK_SCENARIOS[wanted].status?.active ?? 'active'
+    }
+    return json(res, 200, { scenario: mockState.scenario, scenarios: Object.keys(MOCK_SCENARIOS) })
+  }
+  if (path === '/_dash/status') return json(res, 200, mockStatus())
+  if (path === '/_dash/latest') {
+    return json(res, 200, mockScenario().latest ??
+      { installed: '0.0.32-nightly.20260801.990', latest: '0.0.32-nightly.20260801.990', upToDate: true })
+  }
+  if (path === '/_dash/changelog') return json(res, 200, mockChangelog())
+  if (path === '/_dash/fork' || path === '/_dash/fork/refresh') {
+    if (mockScenario().npm) return json(res, 404, { error: 'source mode is not configured' })
+    return json(res, 200, mockFork())
+  }
+  if (path === '/_dash/self' || path === '/_dash/self/refresh') {
+    const behind = mockScenario().self?.behind ?? 0
+    return json(res, 200, {
+      repo: '/mock/t3code-host', branch: 'main', head: '1a2b3c4',
+      dirty: false, behind,
+      commits: MOCK_COMMITS.slice(0, behind),
+      copyCurrent: behind === 0, managed: true,
+      active: mockState.job?.state === 'running' ? mockState.job.id : null,
+    })
+  }
+  if (path === '/_dash/dev-runner') {
+    if (post) {
+      const action = url.searchParams.get('action')
+      if (action === 'start' && mockState.runner === 'stopped') {
+        mockState.runner = 'starting'
+        setTimeout(() => { if (mockState.runner === 'starting') mockState.runner = 'running' }, 1500).unref()
+      } else if (action === 'stop' && mockState.runner === 'running') {
+        mockState.runner = 'stopping'
+        setTimeout(() => { if (mockState.runner === 'stopping') mockState.runner = 'stopped' }, 1000).unref()
+      }
+    }
+    return json(res, 200, mockRunnerStatus())
+  }
+  if (post && path === '/_dash/job') {
+    try {
+      const job = startMockJob(url.searchParams.get('name'))
+      return json(res, 200, { id: job.id, name: job.name })
+    } catch (err) {
+      return json(res, err.conflict ? 409 : 400, { error: err.message })
+    }
+  }
+  if (path.startsWith('/_dash/job/')) {
+    const job = mockJobs.get(path.slice('/_dash/job/'.length))
+    if (!job) return json(res, 404, { error: 'no such job' })
+    return json(res, 200, job)
+  }
+  if (post && path === '/_dash/action') {
+    const action = url.searchParams.get('name')
+    if (action === 'start' || action === 'restart' || action === 'update') mockState.service = 'active'
+    else if (action === 'stop') mockState.service = 'inactive'
+    else return json(res, 400, { error: `unknown action: ${action}` })
+    return json(res, 200, { ok: true, action, output: `(mock) systemctl --user ${action} t3code.service` })
+  }
+  if (post && path === '/_dash/pair') {
+    return json(res, 409, { error: 'mock mode has no real backend to pair with' })
+  }
+  return json(res, 404, { error: 'not found' })
+}
+
 function json(res, code, body) {
   const payload = JSON.stringify(body)
   res.writeHead(code, {
@@ -1101,6 +1437,7 @@ const server = createServer(async (req, res) => {
         return json(res, 405, { error: 'method not allowed' })
       }
       const html = PAGE.replaceAll('__TOKEN__', TOKEN)
+        .replaceAll('__MOCK__', MOCK ? '1' : '')
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
@@ -1110,6 +1447,10 @@ const server = createServer(async (req, res) => {
 
     // Anything that is not the dashboard page or its API belongs to T3.
     if (!url.pathname.startsWith(API_PREFIX)) return proxy(req, res)
+
+    // In mock mode the canned data answers every API route, so no request
+    // below this line touches git, systemd, npm, or the t3 binary.
+    if (MOCK) return mockApi(req, res, url)
 
     if (req.method === 'GET' && url.pathname === '/_dash/status') {
       return json(res, 200, await status())
@@ -1132,6 +1473,21 @@ const server = createServer(async (req, res) => {
       if (!fork) return json(res, 404, { error: 'source mode is not configured' })
       const active = activeJob && jobs.get(activeJob)?.state === 'running' ? activeJob : null
       return json(res, 200, { ...fork, commits: await incomingCommits(), active })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/_dash/self') {
+      const self = await selfStatus()
+      if (!self) return json(res, 404, { error: 'the dashboard repo is not configured' })
+      return json(res, 200, self)
+    }
+
+    // Like /fork/refresh: fetch first, so the counts agree with the remote now.
+    if (req.method === 'POST' && url.pathname === '/_dash/self/refresh') {
+      if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
+      const self = await selfStatus()
+      if (!self) return json(res, 404, { error: 'the dashboard repo is not configured' })
+      await gitHostOrNull('fetch', '--prune', 'origin')
+      return json(res, 200, await selfStatus())
     }
 
     if (req.method === 'GET' && url.pathname === '/_dash/dev-runner') {
@@ -1347,7 +1703,13 @@ const PAGE = String.raw`<!doctype html>
   .card > h2 .tag { margin-left:auto; text-transform:none; letter-spacing:0; color:var(--dim); font-weight:400; }
   /* This button is in the section heading. Thus it is smaller than a usual
      control. It has no border until you point at it. */
-  .card > h2 button.icon.flat { width:20px; height:20px; font-size:.72rem; margin:-2px -4px -2px 0; }
+  .card > h2 button.icon.flat { width:20px; height:20px; font-size:.72rem; margin:-2px -4px -2px auto; }
+  /* A small real button that sits in a section heading, next to the tag. */
+  .card > h2 button.hbtn {
+    flex:none; min-width:0; margin:-4px 0; padding:.2rem .6rem;
+    font-size:.68rem; letter-spacing:0; text-transform:none;
+  }
+  .dot.mini { width:7px; height:7px; vertical-align:baseline; }
   button.icon.flat[data-spin] { animation:spin .8s linear infinite; }
 
   .row { display:flex; justify-content:space-between; gap:1rem; padding:.12rem 0; font-size:.78rem; }
@@ -1397,18 +1759,72 @@ const PAGE = String.raw`<!doctype html>
     display:grid; place-items:center; font-size:.8rem; border-color:transparent;
   }
   button.icon:hover:not(:disabled) { border-color:#26262b; }
-
-  /* A count gets a chip only when the count is not zero. Thus the strip is
-     empty when there is no work to do. */
-  .chips { display:flex; flex-wrap:wrap; gap:.35rem; margin:0 0 .6rem; }
-  .chips:empty { display:none; }
-  .chip {
-    font-size:.7rem; padding:.15rem .45rem; border-radius:5px;
-    border:1px solid var(--line); color:var(--dim); background:var(--panel);
+  /* The step that a job is executing right now. It stays readable while every
+     job button is disabled, so you can see which one is in flight. */
+  button.running, button.running:disabled {
+    opacity:1; border-color:#4a3a12; color:var(--amber);
   }
-  .chip b { font-weight:600; color:#d4d4d8; }
-  .chip.warn { border-color:#4a3a12; color:var(--amber); background:#17130a; }
-  .chip.warn b { color:var(--amber); }
+  button.running::after {
+    content:''; display:inline-block; vertical-align:-1px; margin-left:.45rem;
+    width:9px; height:9px; border-radius:50%;
+    border:1.5px solid #4a3a12; border-top-color:var(--amber);
+    animation:spin .8s linear infinite;
+  }
+
+  /* The service facts are two dim lines under the state, not a label/value
+     table: none of them ask for alignment, and the vertical space belongs to
+     the sections below. */
+  .svc-line {
+    color:var(--faint); font-size:.73rem; line-height:1.7; word-break:break-all;
+  }
+  .svc-line a, .svc-line .val { color:var(--dim); }
+
+  /* The pipeline is a vertical list of steps. Each row is the action, its
+     place in the flow (the glyph), and what stands between it and done (the
+     meta on the right). One row therefore replaces a button, a chip, and half
+     a sentence of the old note. */
+  .steps {
+    display:flex; flex-direction:column;
+    border:1px solid var(--line-soft); border-radius:8px; overflow:hidden;
+  }
+  .step {
+    display:flex; align-items:center; gap:.6rem; width:100%; min-width:0;
+    flex:none; background:none; border:0; border-radius:0; padding:.5rem .7rem;
+    font-size:.78rem; color:var(--dim); text-align:left;
+  }
+  .step + .step { border-top:1px solid var(--line-soft); }
+  .step:hover:not(:disabled) { background:var(--raised); color:var(--text); border-color:var(--line-soft); border-top-color:var(--line-soft); }
+  /* A finished or blocked step is information, not an error: keep it legible
+     and let the glyph and meta carry the state instead of a heavy fade. */
+  .step:disabled { opacity:1; color:var(--faint); cursor:default; }
+  /* Only a step that can actually run reads as a control: it is brighter,
+     and it carries a chevron. The rest are status lines. */
+  .step:not(:disabled) { color:var(--text); cursor:pointer; }
+  .step:not(:disabled)::after { content:'›'; flex:none; color:var(--accent); }
+  .step .glyph { flex:none; width:1rem; text-align:center; color:var(--faint); }
+  .step .glyph::before { content:'○'; }
+  .step.complete .glyph::before { content:'✓'; color:var(--green); }
+  .step.current { color:var(--text); background:rgba(125,211,252,.04); }
+  .step.current .glyph::before { content:'●'; color:var(--accent); }
+  .step .lbl { flex:none; }
+  .step .meta { margin-left:auto; color:var(--faint); font-size:.7rem; text-align:right; }
+  .step.current .meta { color:var(--accent); }
+  .step .meta.warn { color:var(--amber); }
+  /* The running job spins in the glyph column; the generic trailing spinner
+     of button.running would sit past the meta, in the wrong column. */
+  .step.running::after { content:none; }
+  .step.running, .step.running:disabled { color:var(--amber); }
+  .step.running .glyph::before {
+    content:''; display:block; width:9px; height:9px; margin:0 auto;
+    border-radius:50%; border:1.5px solid #4a3a12; border-top-color:var(--amber);
+    animation:spin .8s linear infinite;
+  }
+
+  .dev-empty {
+    padding:.8rem; border:1px dashed var(--line); border-radius:7px;
+    color:var(--faint); font-size:.75rem; line-height:1.55;
+  }
+  .dev-line { color:var(--faint); font-size:.72rem; margin:0 0 .6rem; word-break:break-all; }
 
   /* Each section keeps its natural height. The open foldout takes the
      remaining space. The body of the foldout scrolls, and not the section.
@@ -1456,6 +1872,7 @@ const PAGE = String.raw`<!doctype html>
 
   .muted { color:var(--faint); font-size:.73rem; line-height:1.55; }
   .note { font-size:.75rem; line-height:1.6; margin-top:.65rem; color:var(--dim); }
+  .note:empty { display:none; }
   .note .bad-text { color:var(--red); }
   .note .warn-text { color:var(--amber); }
 
@@ -1466,6 +1883,11 @@ const PAGE = String.raw`<!doctype html>
     font-size:.66rem; letter-spacing:.13em; text-transform:uppercase; color:var(--faint);
   }
   .log-head .job { text-transform:none; letter-spacing:0; color:var(--dim); margin-left:auto; }
+  /* The newest line takes the colour of the outcome, so a failure is visible
+     without opening the full log. */
+  .log-card[data-state="running"] pre#log { color:#c9c9cf; }
+  .log-card[data-state="ok"] pre#log { color:var(--green); }
+  .log-card[data-state="failed"] pre#log { color:var(--red); }
   .log-line { display:flex; align-items:baseline; gap:.6rem; }
   pre#log {
     margin:0; flex:1 1 auto; min-width:0;
@@ -1501,6 +1923,22 @@ const PAGE = String.raw`<!doctype html>
     color:#9d9da5; font-size:.74rem; line-height:1.55;
   }
 
+  /* confirm --------------------------------------------------------------- */
+  /* One dialog for every job, in place of the browser's confirm(). The page's
+     own styling makes the message readable, and Enter/Esc still work. */
+  dialog#confirm {
+    width:min(420px, 90vw); padding:0; color:var(--text);
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    box-shadow:0 24px 60px -20px #000;
+  }
+  dialog#confirm::backdrop { background:rgba(0,0,0,.6); }
+  .confirm-body {
+    margin:0; padding:.85rem .95rem .2rem; color:var(--dim);
+    font-size:.79rem; line-height:1.65;
+  }
+  .confirm-actions { display:flex; gap:.5rem; justify-content:flex-end; padding:.8rem .95rem .9rem; }
+  .confirm-actions button { flex:0 0 auto; min-width:96px; }
+
   /* release notes / commits ------------------------------------------------ */
   #notes { margin-top:.8rem; border-top:1px solid var(--line-soft); padding-top:.3rem;
            max-height:24rem; overflow:auto; }
@@ -1510,9 +1948,18 @@ const PAGE = String.raw`<!doctype html>
   .rel time { color:var(--faint); font-size:.7rem; }
   .rel ul { margin:.4rem 0 0; padding-left:1.05rem; }
   .rel li { color:#a9a9b1; margin:.18rem 0; font-size:.75rem; }
-  .rel .sub { color:var(--faint); margin:.55rem 0 .1rem; font-size:.68rem;
-              text-transform:uppercase; letter-spacing:.09em; }
+  .sub { color:var(--faint); margin:.55rem 0 .1rem; font-size:.68rem;
+         text-transform:uppercase; letter-spacing:.09em; }
   .scope { color:var(--violet); }
+  /* Incoming commits: the sha is a column of its own, dim, and the message
+     keeps to one line. The list scans as a list, not as a paragraph. */
+  .commit { display:flex; align-items:baseline; gap:.55rem; padding:.16rem 0; font-size:.73rem; }
+  .commit .sha { flex:none; color:var(--faint); font-size:.68rem; }
+  .commit .msg {
+    min-width:0; color:#a9a9b1;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  #self-commits { margin:0 0 .6rem; }
 
   /* stage / iframe --------------------------------------------------------- */
   /* The frame is always this origin's root and the console is one click from
@@ -1535,6 +1982,11 @@ const PAGE = String.raw`<!doctype html>
   }
   .tab:hover:not(:disabled) { color:var(--dim); background:var(--raised); border-color:transparent; }
   .tab[aria-selected="true"] { color:var(--accent); background:#12242c; border-color:#2b4a5a; }
+  select#mock-picker {
+    flex:0 0 auto; background:var(--raised); color:var(--amber);
+    border:1px solid #4a3a12; border-radius:6px; font:inherit; font-size:.7rem;
+    padding:.2rem .35rem; cursor:pointer;
+  }
   .frame-wrap { position:relative; flex:1 1 auto; min-height:0; }
   iframe#frame { width:100%; height:100%; border:0; background:#0a0a0b; display:block; }
   .placeholder {
@@ -1579,7 +2031,7 @@ const PAGE = String.raw`<!doctype html>
             <button data-action="stop" class="icon danger" title="Stop" aria-label="Stop">■</button>
           </div>
         </div>
-        <dl id="status"></dl>
+        <div id="status"></div>
       </section>
 
       <!-- Hidden in source mode: the npm release line says nothing about a
@@ -1596,19 +2048,24 @@ const PAGE = String.raw`<!doctype html>
       <!-- What is true now, then the one action for it. Everything a decision
            does not need sits behind Details. -->
       <section class="card" id="fork-card" hidden>
-        <h2>fork
-          <span class="tag" id="fork-branch">—</span>
+        <h2>release
           <button id="fork-refresh" class="icon flat" title="Check for new upstream changes"
             aria-label="Check for new upstream changes">⟳</button>
         </h2>
-        <div class="chips" id="fork-chips"></div>
-        <div id="fork-note" class="note"></div>
-        <!-- One button for each merge. The arrow gives the direction, so the
-             label states what moves and where it goes. -->
-        <div class="actions" style="margin-top:.7rem">
-          <button id="job-main">main &larr; upstream</button>
-          <button id="job-merge-deploy" class="primary">deploy &larr; main</button>
+        <!-- The pipeline from upstream to the running service, one row per
+             step. The glyph gives the position in the flow, the meta gives
+             what the step would act on, and the row itself is the action. -->
+        <div class="steps" aria-label="Release pipeline">
+          <button class="step" id="job-main"><span class="glyph"></span>
+            <span class="lbl">Sync main</span><span class="meta" id="meta-main"></span></button>
+          <button class="step" id="job-merge-deploy"><span class="glyph"></span>
+            <span class="lbl">Merge into deploy</span><span class="meta" id="meta-merge"></span></button>
+          <button class="step" id="build-run"><span class="glyph"></span>
+            <span class="lbl">Build</span><span class="meta" id="meta-build"></span></button>
+          <button class="step" id="build-deploy"><span class="glyph"></span>
+            <span class="lbl">Deploy</span><span class="meta" id="meta-deploy"></span></button>
         </div>
+        <div id="fork-note" class="note"></div>
         <!-- Not a <details>: that element slots its content into a UA shadow
              tree, so the body is not a flex child of it and cannot be given
              the leftover height to scroll in. A plain button and div can. -->
@@ -1624,27 +2081,42 @@ const PAGE = String.raw`<!doctype html>
         </div>
       </section>
 
+      <!-- The dev server lives in the heading, mirroring the service line at
+           the top: a dot, the state, and the one control that applies. -->
       <section class="card" id="dev-card" hidden>
-        <h2>dev <span class="tag" id="dev-runner-state">stopped</span></h2>
-        <dl id="fork-dev-status"></dl>
-        <div id="fork-dev-note" class="note"></div>
-        <div class="actions" style="margin-top:.7rem">
-          <button id="job-merge-dev">dev &larr; deploy</button>
-          <button id="fork-promote">deploy &larr; dev</button>
+        <h2>dev
+          <span class="tag"><span class="dot mini" id="dev-runner-dot"></span>
+            <span id="dev-runner-state">stopped</span></span>
+          <button id="dev-runner-toggle" class="hbtn"
+            title="Runs the dev worktree from source with hot reload, alongside the deployed build.">Start</button>
+        </h2>
+        <div class="dev-empty" id="dev-empty" hidden>No development worktree is configured.</div>
+        <div id="dev-content">
+          <div class="dev-line" id="dev-line">—</div>
+          <div class="steps" aria-label="Dev branch actions">
+            <button class="step" id="job-merge-dev"><span class="glyph"></span>
+              <span class="lbl">dev &larr; deploy</span><span class="meta" id="meta-merge-dev"></span></button>
+            <button class="step" id="fork-promote"><span class="glyph"></span>
+              <span class="lbl">deploy &larr; dev</span><span class="meta" id="meta-promote"></span></button>
+          </div>
+          <div id="fork-dev-note" class="note"></div>
+          <div id="dev-runner-note" class="note"></div>
         </div>
-        <div class="actions" style="margin-top:.45rem">
-          <button id="dev-runner-toggle">Start dev server</button>
-        </div>
-        <div id="dev-runner-note" class="muted" style="margin-top:.55rem"></div>
       </section>
 
-      <section class="card" id="build-card" hidden>
-        <h2>build</h2>
-        <dl id="fork-build-status"></dl>
-        <div class="actions" style="margin-top:.7rem">
-          <button id="build-run">Build</button>
-          <button id="build-deploy" class="primary">Deploy</button>
+      <!-- The dashboard watching its own repo. The action pulls and restarts
+           only the dashboard unit; T3 Code and its sessions are untouched. -->
+      <section class="card" id="self-card" hidden>
+        <h2>dashboard
+          <button id="self-refresh" class="icon flat" title="Check for dashboard updates"
+            aria-label="Check for dashboard updates">⟳</button>
+        </h2>
+        <div id="self-commits" hidden></div>
+        <div class="steps">
+          <button class="step" id="job-self-update"><span class="glyph"></span>
+            <span class="lbl">Pull &amp; restart</span><span class="meta" id="meta-self"></span></button>
         </div>
+        <div id="self-note" class="note"></div>
       </section>
 
       <!-- One line of it: the latest line is the status, and the rest is only
@@ -1652,12 +2124,24 @@ const PAGE = String.raw`<!doctype html>
       <section class="card log-card">
         <div class="log-head">activity <span class="job" id="log-job"></span></div>
         <div class="log-line">
-          <pre id="log">ready</pre>
+          <pre id="log" aria-live="polite">ready</pre>
           <button id="log-more" class="linkish" hidden>Show more</button>
         </div>
       </section>
     </div>
   </aside>
+
+  <dialog id="confirm">
+    <div class="modal-head">
+      <span>confirm</span>
+      <span class="job" id="confirm-title"></span>
+    </div>
+    <p class="confirm-body" id="confirm-text"></p>
+    <div class="confirm-actions">
+      <button id="confirm-cancel">Cancel</button>
+      <button id="confirm-ok" class="primary">Proceed</button>
+    </div>
+  </dialog>
 
   <dialog id="log-modal">
     <div class="modal-head">
@@ -1679,6 +2163,9 @@ const PAGE = String.raw`<!doctype html>
         <button class="tab" data-target="dev" role="tab" aria-selected="false">dev</button>
       </div>
       <span class="spacer"></span>
+      <!-- Mock mode only: switches the canned scenario that every /_dash
+           route answers with, so each state of the sidebar can be seen. -->
+      <select id="mock-picker" hidden aria-label="Mock scenario"></select>
       <button id="frame-reload" class="icon" title="Reload" aria-label="Reload">⟳</button>
     </div>
     <div class="frame-wrap">
@@ -1746,33 +2233,36 @@ async function refresh() {
   // Serve publishes the dashboard; T3 itself is the tailnet address it binds to.
   const action = (name) => document.querySelector('[data-action="' + name + '"]')
 
+  // A control that cannot apply is absent, not greyed out. Without systemd
+  // there is nothing to control; on a running unit there is no start; on a
+  // stopped one no stop. Restart stays: on a stopped unit it is simply a start.
   managed = s.managed !== false
+  document.querySelector('.actions.toolbar').hidden = !managed
   if (!managed) {
-    for (const b of document.querySelectorAll('[data-action]')) b.disabled = true
     $('update').disabled = true
     $('update').textContent = 'Managed by dev server'
   } else {
-    // Starting a running service and stopping a stopped one are both no-ops
-    // that come back as an error, so neither is offered. Restart stays live:
-    // on a stopped unit it is simply a start.
     const running = s.active === 'active'
-    action('start').disabled = running
-    action('stop').disabled = !running
-    action('restart').disabled = false
+    action('start').hidden = running
+    action('stop').hidden = !running
   }
 
   $('state-dot').className = 'dot ' + dotClass(s.active)
   $('state-label').textContent = s.active + (s.sub && s.sub !== s.active ? ' · ' + s.sub : '')
   $('state-meta').textContent = s.active === 'active' ? uptime(s.startedAt) : s.enabled
 
-  $('status').innerHTML = [
-    ['unit', esc(s.unit)],
-    ['enabled', esc(s.enabled)],
-    ['pid', s.pid ?? '—'],
-    ['restarts', esc(s.restarts)],
-    // The dashboard's own URL is the address of the page you are reading it on.
-    ['t3code', s.origin ? esc(s.origin) : '<span class="muted">not running</span>'],
-  ].map(([k, v]) => '<div class="row"><dt>' + k + '</dt><dd>' + v + '</dd></div>').join('')
+  // Two dim lines instead of a table: the unit facts, then what is running.
+  // The dashboard's own URL is the address of the page you are reading it on.
+  $('status').innerHTML =
+    '<div class="svc-line">' + [
+      esc(s.unit), esc(s.enabled),
+      s.pid ? 'pid ' + esc(s.pid) : null,
+      Number(s.restarts) > 0 ? esc(s.restarts) + ' restarts' : null,
+    ].filter(Boolean).join(' · ') + '</div>' +
+    (s.installed && s.installed !== 'unknown'
+      ? '<div class="svc-line">v<span class="val">' + esc(s.installed) + '</span></div>' : '') +
+    '<div class="svc-line">' + (s.origin
+      ? '<span class="val">' + esc(s.origin) + '</span>' : 'not running') + '</div>'
 
   installed = s.installed
   renderVersion()
@@ -1992,52 +2482,46 @@ $('changelog').onclick = async (e) => {
 
 let forkMode = false, polling = null
 
-// Use the counts that are not zero. Thus the strip shows the necessary work,
-// and it does not show a correct state six times.
-function forkChips(f) {
-  const chips = []
-  const add = (label, value, warn) =>
-    chips.push('<span class="chip' + (warn ? ' warn' : '') + '"><b>' + esc(String(value)) +
-      '</b> ' + esc(label) + '</span>')
+// Each step's meta states what stands between that step and done, or the fact
+// that nothing does. A warning condition takes the meta over, because it is
+// what blocks the step.
+// One git log --oneline line becomes a sha column and a one-line message
+// with the conventional-commit scope highlighted.
+function commitRows(list) {
+  return list.map((c) => {
+    const m = /^(\S+)\s+(.*)$/.exec(c)
+    const msg = esc(m ? m[2] : c)
+      .replace(/^(\w+(?:\([^)]+\))?!?):/, '<span class="scope">$1</span>:')
+    return '<div class="commit"><span class="sha">' + esc(m ? m[1] : '') + '</span>' +
+      '<span class="msg" title="' + esc(m ? m[2] : c) + '">' + msg + '</span></div>'
+  }).join('')
+}
 
-  if (f.mainBehind > 0) add('upstream', f.mainBehind)
-  if (f.deployBehind > 0) add('behind main', f.deployBehind)
-  if (f.dev.ahead > 0) add('dev ahead', f.dev.ahead)
-  if (f.dirty) chips.push('<span class="chip warn">worktree dirty</span>')
-  if (f.dev.dirty) chips.push('<span class="chip warn">dev dirty</span>')
-  if (f.needsRebuild) chips.push('<span class="chip warn">build stale</span>')
-  return chips.join('')
+function setStepMeta(id, text, warn) {
+  const meta = $(id)
+  meta.textContent = text
+  meta.classList.toggle('warn', Boolean(warn))
 }
 
 function renderFork(f) {
   $('fork-card').hidden = false
   $('dev-card').hidden = false
-  $('build-card').hidden = false
   // The npm version line shows a release that this build does not come from.
   // Also, the update replaces the build of the fork. Thus remove the
   // section.
   $('version-card').hidden = true
   forkMode = true
 
-  $('fork-branch').textContent = f.branch + ' @ ' + (f.tip ?? '—')
-  $('fork-chips').innerHTML = forkChips(f)
   const flag = (text) => ' <span style="color:var(--amber)">(' + text + ')</span>'
   const rows = (items) => items
     .map(([k, v]) => '<div class="row"><dt>' + esc(k) + '</dt><dd>' + v + '</dd></div>').join('')
 
   $('fork-upstream-status').innerHTML = rows([
+    ['worktree', esc(f.repo)],
+    [f.branch + ' tip', esc(f.tip ?? '—')],
     ['main behind upstream', String(f.mainBehind)],
     [f.branch + ' behind main', String(f.deployBehind)],
   ])
-  $('fork-dev-status').innerHTML = rows([
-    ['ahead / behind ' + f.branch, String(f.dev.ahead) + ' / ' + String(f.dev.behind)],
-    ['worktree', esc((f.dev.repo || '—').split('/').pop()) + (f.dev.dirty ? flag('dirty') : '')],
-  ])
-  $('fork-build-status').innerHTML = rows([
-    ['checked out', esc(f.checkedOut ?? '—') + (f.dirty ? flag('dirty') : '')],
-    ['built', f.built ? esc(f.built) + (f.needsRebuild ? flag('stale') : '') : '—'],
-  ])
-
   const pending = f.mainBehind > 0 || f.deployBehind > 0
   const blocked = f.dirty || !f.clean || !managed
   // Each button states only its own conditions. A sync and a promote move
@@ -2045,35 +2529,70 @@ function renderFork(f) {
   // restarts the service, so it needs the unit but no clean worktree.
   const busy = Boolean(f.active)
   const hasDev = Boolean(f.dev.repo && f.dev.repo !== f.repo)
+  $('dev-empty').hidden = hasDev
+  $('dev-content').hidden = !hasDev
+  // The path answers "where do I go to work on this"; the ahead/behind counts
+  // already live in the two step metas below.
+  $('dev-line').innerHTML = esc(f.dev.repo || '—') + (f.dev.dirty ? flag('dirty') : '')
   $('job-main').disabled = busy || f.mainBehind === 0
-  $('job-merge-deploy').disabled = busy || f.dirty || !f.clean || f.deployBehind === 0
+  $('job-merge-deploy').disabled = busy || f.dirty || !f.clean || f.mainBehind > 0 || f.deployBehind === 0
   $('job-merge-dev').disabled = busy || !hasDev || f.dev.dirty || f.dev.behind === 0
   $('fork-promote').disabled = busy || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0
-  $('build-run').disabled = busy || f.dirty
-  $('build-deploy').disabled = busy || !managed || !f.hasBuild
+  $('build-run').disabled = busy || !managed || f.dirty || !f.needsRebuild || pending
+  $('build-deploy').disabled = busy || !managed || !f.needsDeploy || f.needsRebuild || pending
 
+  const flow = ['job-main', 'job-merge-deploy', 'build-run', 'build-deploy']
+  const currentStep = f.mainBehind > 0 ? 0
+    : f.deployBehind > 0 ? 1
+      : f.needsRebuild ? 2
+        : f.needsDeploy ? 3
+          : flow.length
+  for (const [index, id] of flow.entries()) {
+    const button = $(id)
+    button.classList.toggle('current', index === currentStep)
+    button.classList.toggle('complete', index < currentStep)
+    if (index === currentStep) button.setAttribute('aria-current', 'step')
+    else button.removeAttribute('aria-current')
+  }
+
+  setStepMeta('meta-main', f.mainBehind > 0 ? f.mainBehind + ' upstream' : 'synced')
+  setStepMeta('meta-merge',
+    !f.clean ? 'conflicts'
+      : f.dirty ? 'worktree dirty'
+      : f.deployBehind > 0 ? f.deployBehind + ' to merge' : 'merged',
+    !f.clean || f.dirty)
+  setStepMeta('meta-build',
+    f.dirty ? 'worktree dirty'
+      : !f.needsRebuild ? 'current'
+      : f.hasBuild ? 'stale' : 'no build',
+    f.dirty || f.needsRebuild)
+  setStepMeta('meta-deploy',
+    f.needsDeploy ? 'ready: ' + (f.built ?? '?')
+      : f.deployed ? 'live @ ' + f.deployed : '—')
+  setStepMeta('meta-merge-dev', f.dev.behind > 0 ? f.dev.behind + ' to merge' : 'up to date')
+  setStepMeta('meta-promote',
+    !f.dev.clean ? 'conflicts'
+      : f.dev.dirty ? 'dev dirty'
+      : f.dev.ahead > 0 ? f.dev.ahead + ' to promote' : 'nothing new',
+    !f.dev.clean || f.dev.dirty)
+
+  // The pipeline rows already say what is pending; the note speaks only when
+  // something blocks them.
   $('fork-note').innerHTML = f.dirty
-    ? 'Worktree has uncommitted changes. Resolve them in ' + esc(f.repo) + ' first.'
+    ? '<span class="warn-text">Uncommitted changes</span> in ' + esc(f.repo) + '.'
     : !f.clean
-      ? '<span class="bad-text">Conflicts — merge by hand:</span> ' + esc(f.conflicts.join(', '))
-      : pending
-        ? f.mainBehind + ' upstream commit(s) to merge. Move main, then deploy, then dev.'
-        : f.needsRebuild
-          ? 'The branches agree with upstream. The build is older than the branch tip. Build, then deploy.'
-          : 'The branches agree with upstream.'
+      ? '<span class="bad-text">Conflicts:</span> ' + esc(f.conflicts.join(', '))
+      : ''
 
   $('fork-dev-note').innerHTML = f.dev.dirty
-    ? 'Development changes are safe in ' + esc(f.dev.repo) + '. Commit them before merging into ' + esc(f.branch) + '.'
+    ? '<span class="warn-text">Uncommitted changes</span> in ' + esc(f.dev.repo) + '. Commit before merging.'
     : !f.dev.clean
-      ? '<span class="bad-text">Dev merge conflicts — resolve in the dev worktree:</span> ' + esc(f.dev.conflicts.join(', '))
-      : f.dev.ahead > 0
-        ? f.dev.ahead + ' committed dev change(s) to promote. The promotion moves the branch only.'
-        : 'Nothing to promote. Dev agrees with ' + esc(f.branch) + '.'
+      ? '<span class="bad-text">Conflicts:</span> ' + esc(f.dev.conflicts.join(', '))
+      : ''
 
   const box = $('fork-commits')
   box.innerHTML = f.commits.length
-    ? '<div class="rel"><p class="sub">incoming</p><ul>' +
-      f.commits.map((c) => '<li>' + esc(c) + '</li>').join('') + '</ul></div>'
+    ? '<p class="sub">incoming</p>' + commitRows(f.commits)
     : ''
   box.hidden = !f.commits.length
   // New commits change the quantity of content. Thus calculate the effect
@@ -2125,7 +2644,18 @@ $('fork-refresh').onclick = async (e) => {
 async function refreshFork() {
   try {
     const r = await fetch('/_dash/fork')
-    if (!r.ok) return
+    if (!r.ok) {
+      // Source mode can go away (in mock mode, at a scenario switch). Give the
+      // npm sections back rather than showing a stale fork.
+      if (r.status === 404 && forkMode) {
+        forkMode = false
+        $('fork-card').hidden = true
+        $('dev-card').hidden = true
+        $('version-card').hidden = false
+        renderVersion()
+      }
+      return
+    }
     const f = await r.json()
     renderFork(f)
     // Re-attach after a page reload so a running build is never orphaned.
@@ -2135,30 +2665,123 @@ async function refreshFork() {
   }
 }
 
+// The running flow button gets a marker, and the activity line takes the
+// colour of the outcome. Thus the sidebar shows which step is in flight, and a
+// failure is visible without opening the log.
+function setLogState(state) {
+  document.querySelector('.log-card').dataset.state = state ?? ''
+}
+
+function markRunningJob(name) {
+  for (const [id, jobName] of JOB_UI) $(id).classList.toggle('running', jobName === name)
+}
+
 function pollJob(id) {
   clearInterval(polling)
+  let jobName = null
   polling = setInterval(async () => {
     try {
       const job = await (await fetch('/_dash/job/' + id)).json()
+      jobName = job.name
       $('log-job').textContent = job.name + ' · ' + job.state + ' · ' + job.step
+      setLogState(job.state === 'running' ? 'running' : job.state)
+      markRunningJob(job.state === 'running' ? job.name : null)
       log(job.output)
       if (job.state !== 'running') {
         clearInterval(polling)
         polling = null
         refresh()
         refreshFork()
+        refreshSelf()
+        // The self-update's last step restarts this server moments after the
+        // job reports done. In mock mode nothing restarts.
+        if (job.name === 'self-update' && job.state === 'ok' && '__MOCK__' !== '1') waitForRestart()
       }
     } catch {
       clearInterval(polling)
       polling = null
+      markRunningJob(null)
+      // A dropped poll during a self-update is the restart itself.
+      if (jobName === 'self-update') waitForRestart()
     }
   }, 1000)
+}
+
+// ---------------------------------------------------------------------------
+// the dashboard's own updates
+// ---------------------------------------------------------------------------
+
+function renderSelf(s) {
+  $('self-card').hidden = false
+  const stale = s.behind > 0 || s.copyCurrent === false
+  const btn = $('job-self-update')
+  btn.classList.toggle('current', stale && !s.dirty)
+  btn.classList.toggle('complete', !stale)
+  btn.disabled = !stale || s.dirty || Boolean(s.active)
+  setStepMeta('meta-self',
+    s.dirty ? 'repo dirty'
+      : s.behind > 0 ? s.behind + ' new commit(s)'
+      : s.copyCurrent === false ? 'restart to apply'
+      : 'up to date @ ' + (s.head ?? '—'),
+    s.dirty)
+  $('self-note').innerHTML = s.dirty
+    ? '<span class="warn-text">Uncommitted changes</span> in ' + esc(s.repo) + '.' : ''
+  const box = $('self-commits')
+  box.innerHTML = s.commits.length ? commitRows(s.commits) : ''
+  box.hidden = !s.commits.length
+}
+
+async function refreshSelf() {
+  try {
+    const r = await fetch('/_dash/self')
+    if (r.ok) renderSelf(await r.json())
+  } catch {
+    // keep the last known state on the screen
+  }
+}
+
+$('self-refresh').onclick = async (e) => {
+  const btn = e.currentTarget
+  btn.disabled = true
+  btn.setAttribute('data-spin', '')
+  try {
+    const res = await fetch('/_dash/self/refresh', { method: 'POST', headers: { 'x-token': TOKEN } })
+    const s = await res.json()
+    if (!res.ok) throw new Error(s.error ?? 'refresh failed')
+    renderSelf(s)
+    log('checked for dashboard updates')
+  } catch (err) {
+    log('dashboard check failed: ' + err.message)
+  } finally {
+    btn.disabled = false
+    btn.removeAttribute('data-spin')
+  }
+}
+
+// The update restarts this very server. Once the job is under way, wait for
+// the restart to finish and load the new page, rather than reporting the
+// dropped connection as a failure.
+async function waitForRestart() {
+  setLogState('running')
+  log('dashboard restarting…')
+  let sawItGoDown = false
+  for (let attempt = 0; attempt < 90; attempt++) {
+    await new Promise((r) => setTimeout(r, 1000))
+    try {
+      const r = await fetch('/_dash/status', { cache: 'no-store' })
+      if (r.ok && (sawItGoDown || attempt > 20)) return location.reload()
+    } catch {
+      sawItGoDown = true
+    }
+  }
+  location.reload()
 }
 
 // Every job button, so a running job disables all of them and the page cannot
 // start a second job on the same repository.
 const JOB_BUTTONS = [
   'job-main', 'job-merge-deploy', 'job-merge-dev', 'fork-promote', 'build-run', 'build-deploy',
+  'job-self-update',
 ]
 
 async function startJob(name) {
@@ -2174,38 +2797,48 @@ async function startJob(name) {
   }
 }
 
+// The page's own dialog in place of the browser confirm(): same styling as the
+// rest, and the message is set before the dialog opens, so Enter proceeds and
+// Esc cancels as before.
+function confirmAction(title, message) {
+  return new Promise((resolve) => {
+    const dlg = $('confirm')
+    $('confirm-title').textContent = title
+    $('confirm-text').textContent = message
+    const done = (ok) => { dlg.close(); resolve(ok) }
+    $('confirm-ok').onclick = () => done(true)
+    $('confirm-cancel').onclick = () => done(false)
+    dlg.oncancel = () => resolve(false)
+    dlg.onclick = (e) => { if (e.target === dlg) done(false) }
+    dlg.showModal()
+    $('confirm-ok').focus()
+  })
+}
+
 // Each message names what the job changes, and what it does not change. Only
-// the deploy stops T3 Code, so only its message gives that warning.
-// Each message names the one branch that moves. Only the deploy stops T3 Code,
-// so only its message gives that warning.
-$('job-main').onclick = () => {
-  if (confirm('Move main to upstream/main, and push main. No other branch changes.')) {
-    startJob('main')
-  }
-}
-$('job-merge-deploy').onclick = () => {
-  if (confirm('Merge main into deploy, and push deploy. This builds nothing and restarts nothing.')) {
-    startJob('merge-deploy')
-  }
-}
-$('job-merge-dev').onclick = () => {
-  if (confirm('Merge deploy into dev, and push dev. This builds nothing and restarts nothing.')) {
-    startJob('merge-dev')
-  }
-}
-$('fork-promote').onclick = () => {
-  if (confirm('Merge dev into deploy, and push deploy. This builds nothing and restarts nothing.')) {
-    startJob('promote')
-  }
-}
-$('build-run').onclick = () => {
-  if (confirm('Build the current branch from the source. This changes no branch, and the running service stays as it is.')) {
-    startJob('build')
-  }
-}
-$('build-deploy').onclick = () => {
-  if (confirm('Install the current build and restart T3 Code. This stops your sessions for a short time. It compiles nothing.')) {
-    startJob('deploy')
+// the deploy stops T3 Code, so only its message gives that warning. The same
+// text is the button's tooltip, so you can read what a step does before you
+// click it.
+const JOB_UI = [
+  ['job-main', 'main', 'main ← upstream',
+    'Move main to upstream/main, and push main. No other branch changes.'],
+  ['job-merge-deploy', 'merge-deploy', 'deploy ← main',
+    'Merge main into deploy, and push deploy. This builds nothing and restarts nothing.'],
+  ['job-merge-dev', 'merge-dev', 'dev ← deploy',
+    'Merge deploy into dev, and push dev. This builds nothing and restarts nothing.'],
+  ['fork-promote', 'promote', 'deploy ← dev',
+    'Merge dev into deploy, and push deploy. This builds nothing and restarts nothing.'],
+  ['build-run', 'build', 'build',
+    'Build the current branch from the source. This changes no branch, and the running service stays as it is.'],
+  ['build-deploy', 'deploy', 'deploy',
+    'Install the current build and restart T3 Code. This stops your sessions for a short time. It compiles nothing.'],
+  ['job-self-update', 'self-update', 'update dashboard',
+    'Pull the latest dashboard commits and restart the dashboard. T3 Code and its sessions are not touched.'],
+]
+for (const [id, name, title, message] of JOB_UI) {
+  $(id).title = message
+  $(id).onclick = async () => {
+    if (await confirmAction(title, message)) startJob(name)
   }
 }
 
@@ -2247,10 +2880,16 @@ function renderDevRunner(r) {
   const busy = r.state === 'starting' || r.state === 'stopping'
 
   $('dev-runner-state').textContent = r.configured ? r.state : 'no worktree'
-  $('dev-runner-toggle').disabled = !r.configured || busy
-  $('dev-runner-toggle').textContent = r.state === 'starting' ? 'starting…'
+  $('dev-runner-dot').className = 'dot mini' +
+    (running ? ' ok' : busy ? ' warn' : r.error ? ' bad' : '')
+  $('dev-empty').hidden = r.configured
+  $('dev-content').hidden = !r.configured
+  const toggle = $('dev-runner-toggle')
+  toggle.hidden = !r.configured
+  toggle.disabled = busy
+  toggle.textContent = r.state === 'starting' ? 'starting…'
     : r.state === 'stopping' ? 'stopping…'
-    : running ? 'Stop dev server' : 'Start dev server'
+    : running ? 'Stop' : 'Start'
 
   // A tab for a backend that does not operate gives an HTTP 503 in the
   // frame.
@@ -2260,12 +2899,9 @@ function renderDevRunner(r) {
     loadFrame()
   }
 
-  $('dev-runner-note').textContent = !r.configured
-    ? 'No development worktree is configured for this instance.'
-    : r.error ? r.error
-    : running ? 'Serving ' + r.branch + ' from source with hot reload. Switch with the tabs above the console.'
-    : busy ? 'Starting the fork dev server; the first build takes a moment.'
-    : 'Runs the ' + r.branch + ' worktree from source, alongside the deployed build.'
+  // Only a failure earns a line of text; every other state is in the heading.
+  $('dev-runner-note').innerHTML = r.error
+    ? '<span class="bad-text">' + esc(r.error) + '</span>' : ''
 }
 
 async function refreshDevRunner() {
@@ -2301,13 +2937,38 @@ $('dev-runner-toggle').onclick = async (e) => {
   }
 }
 
+// Mock mode: a scenario picker in the header switches the canned state that
+// the whole page renders from. The '__MOCK__' token is filled by the server.
+async function initMock() {
+  if ('__MOCK__' !== '1') return
+  try {
+    const r = await (await fetch('/_dash/mock')).json()
+    const sel = $('mock-picker')
+    sel.hidden = false
+    sel.innerHTML = r.scenarios.map((s) =>
+      '<option' + (s === r.scenario ? ' selected' : '') + '>' + esc(s) + '</option>').join('')
+    sel.onchange = async () => {
+      await fetch('/_dash/mock?scenario=' + encodeURIComponent(sel.value), {
+        method: 'POST', headers: { 'x-token': TOKEN },
+      })
+      log('mock scenario: ' + sel.value)
+      refresh(); refreshFork(); refreshDevRunner(); checkUpdates()
+    }
+  } catch {
+    // not fatal; the page still works on whatever scenario is active
+  }
+}
+initMock()
+
 setFrameTarget(frameTarget())
 refresh()
 checkUpdates()
 refreshFork()
+refreshSelf()
 refreshDevRunner()
 loadFrame()
 setInterval(refreshFork, 30000)
+setInterval(refreshSelf, 60000)
 setInterval(refreshDevRunner, 10000)
 setInterval(refresh, 5000)
 // npm registry lookup is slower and far less volatile than local service state
@@ -2316,9 +2977,12 @@ setInterval(checkUpdates, 15 * 60 * 1000)
 
 // Keep the remote-tracking refs warm so the behind-counts mean something
 // without every page load paying for a network round trip.
-if (REPO) {
+if (REPO && !MOCK) {
   fetchRemotes()
   setInterval(fetchRemotes, 15 * 60 * 1000).unref()
+}
+if (HOST_REPO && !MOCK) {
+  setInterval(() => gitHostOrNull('fetch', '--prune', 'origin'), 15 * 60 * 1000).unref()
 }
 
 server.on('upgrade', (req, socket, head) => {

@@ -603,11 +603,22 @@ function startDevRunner() {
     state: 'starting', origin: null, home: null, output: '', error: null,
   })
 
+  // Nothing of this dashboard's own T3 configuration may leak into the
+  // runner: an inherited T3CODE_PORT once made a dev backend bind
+  // production's port number, and an inherited T3CODE_HOME is one old branch
+  // away from pointing it at the live ~/.t3. The runner resolves its own
+  // ports and its worktree-local data directory.
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('T3CODE_') || key === 'PORT') delete env[key]
+  }
+
   // The runner starts the backend and Vite as children. Thus it must have its
   // own process group. If it does not, the stop below cannot reach the
   // children.
   const child = spawn(PNPM_BIN, ['dev'], {
     cwd: DEV_REPO,
+    env,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -2875,6 +2886,13 @@ for (const tab of document.querySelectorAll('.tab')) {
 let devRunnerState = 'stopped'
 
 function renderDevRunner(r) {
+  // A runner that dies before announcing its port fails silently otherwise:
+  // put its output in the activity log, where Show more reveals the reason.
+  if (r.state === 'failed' && devRunnerState !== 'failed' && r.error) {
+    $('log-job').textContent = 'dev server · failed'
+    setLogState('failed')
+    log((r.output ? r.output + '\n' : '') + 'FAILED: ' + r.error)
+  }
   devRunnerState = r.state
   const running = r.state === 'running'
   const busy = r.state === 'starting' || r.state === 'stopping'

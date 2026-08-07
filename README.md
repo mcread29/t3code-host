@@ -142,7 +142,7 @@ T3CODE_INSTANCE=dev ./check.sh
 ```
 
 The script adapts to the instance. For an installed instance, it tests the
-systemd units. For a development instance, it tests the two dev servers.
+systemd units. For a development instance, it tests the dashboard shell.
 
 The script tests these items:
 
@@ -165,35 +165,90 @@ immediately after a restart.
 
 ## Development
 
-Development uses two dev servers in your session. The two servers install
-nothing. They make no systemd units. They publish no Tailscale Serve address.
-The production instance stays unchanged.
+`./dev.sh` runs the dashboard shell alone. It installs nothing. It makes no
+systemd units. It publishes no Tailscale Serve address. The production instance
+stays unchanged.
 
 ```bash
-./dev.sh          # start the two dev servers, Ctrl-C stops them
-./dev.sh check    # test the dev servers
+./dev.sh          # start the dashboard shell, Ctrl-C stops it
+./dev.sh check    # test the dev instance
 ./dev.sh down     # remove an old installed dev instance
 ```
 
-`./dev.sh` starts the dev runner of the fork in the development worktree. This
-runner serves T3 Code from the source with hot reload. `./dev.sh` also starts
-the dashboard with `node --watch` from this repository.
+`src/dev-stub-t3.mjs` replaces T3 Code. This stub is a placeholder. It answers
+the proxy. It gives its own name on the page. There is no worktree of the fork.
+There is no build from the source. There is no delay of some minutes. The
+dashboard starts again after you save a file.
 
 ```text
-dashboard   http://<tailscale-ip>:5124/   node --watch, starts again after you save
-T3 Code     http://localhost:<port>/      hot reload, the dashboard proxies it
+dashboard   http://<tailscale-ip>:5124/dashboard   node --watch, starts again after you save
+T3 Code     http://localhost:<port>/               the stub, not the console
 ```
 
-Both servers reload after you save a file.
+The service buttons and the build buttons are off, because there is no systemd
+unit. The dev server buttons are also off, because the shell has no development
+worktree.
 
-The dev runner keeps T3 Code on the loopback address. The dashboard is the only
-part on the Tailnet address. There are two results. The service buttons and the
-build buttons are off, because there is no systemd unit. The network screens of
-T3 Code show less, because the address is a loopback address.
+Use the `/dashboard` path in development. The dashboard and T3 Code use the
+same root path. The dashboard divides them with the `Sec-Fetch-Dest` header.
+Browsers send this header on HTTPS only. Development uses a plain HTTP address.
+Thus the root path gives you T3 Code in development. Production uses an HTTPS
+address. Thus the root path gives you the dashboard in production.
 
 `./dev.sh` cannot use the production instance. It refuses the production
 instance name. It refuses the production ports. It refuses the production
 worktree.
+
+## The dev server
+
+To use the real T3 Code, open the production dashboard. The **dev** section has
+a **Start dev server** button. This button starts the dev runner of the fork in
+the development worktree. The runner serves that worktree from the source with
+hot reload.
+
+The dev server is not a systemd unit. Only one build owns the global `t3`
+package. That build is the deploy build. The dev server is a child of the
+dashboard. It needs no build. It stops when the dashboard stops.
+
+While the dev server runs, the console header shows two tabs:
+
+```text
+DEPLOY   the installed build, from the deploy worktree
+DEV      the dev runner, from the dev worktree
+```
+
+The tab writes a cookie on the address of the dashboard. Thus the choice
+applies to your browser only. Other clients on the tailnet continue to use the
+deploy build. Each backend has its own credentials. Thus the dashboard makes a
+new session when you change the tab.
+
+## The branch workflow
+
+There are three branches. `main` is a copy of upstream. The production service
+builds `deploy`. You do your work on `dev`.
+
+**Sync, build & deploy** moves the changes in this direction:
+
+```text
+upstream  ->  main  ->  deploy  ->  dev
+```
+
+Each merge does a fast-forward when the history permits one. It makes a merge
+commit only when the history does not permit a fast-forward.
+
+The step that merges `deploy` into `dev` is not fatal. A conflict in this step
+keeps the correct deployed build. You then correct the `dev` branch by hand. If
+the `dev` worktree has uncommitted changes, the step does not run.
+
+**Promote to deploy** moves the changes in the opposite direction:
+
+```text
+dev  ->  deploy  ->  build  ->  restart
+```
+
+After a sync, `deploy` is an ancestor of `dev`. Thus a promotion is usually a
+fast-forward. The build then contains the same commit that you tested on the
+dev server. The two worktrees must have no uncommitted changes.
 
 ## Safety
 
@@ -381,8 +436,10 @@ T3 Code also writes its messages to this file:
 | `update.sh` | Gets the upstream changes, then builds and installs them. |
 | `uninstall.sh` | Removes the units of one instance. |
 | `check.sh` | Tests one instance. |
-| `dev.sh` | Starts the two dev servers. |
+| `dev.sh` | Runs the dashboard shell with the stub. |
+| `AGENTS.md` | The rules for an agent that works here. |
 | `lib/guard.sh` | Protects the production instance. |
 | `src/t3code-dashboard.mjs` | The dashboard and the T3 Code proxy. |
+| `src/dev-stub-t3.mjs` | The substitute for T3 Code, for `./dev.sh`. |
 | `src/t3code-serve-tailnet` | Starts T3 Code on the Tailnet address. |
 | `systemd/*.in` | The templates for the units. |

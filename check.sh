@@ -149,6 +149,10 @@ fi
 if [ "$legacy" = 1 ]; then
   skip "routing checks (legacy dashboard)"
 else
+  # The shell proxies src/dev-stub-t3.mjs and not T3 Code. Thus a page that is
+  # not the dashboard is the console or that stub.
+  is_t3() { grep -qE '<html lang="en"|name="t3code-stub"' <<<"$1"; }
+
   page="$(body_of -H 'Sec-Fetch-Dest: document' "$base/")"
   if grep -q 'class="app"' <<<"$page"; then
     ok "top-level / serves the dashboard"
@@ -158,14 +162,14 @@ else
 
   # Same URL, framed: this is what the iframe requests.
   framed="$(body_of -H 'Sec-Fetch-Dest: iframe' "$base/")"
-  if grep -q '<html lang="en"' <<<"$framed"; then
+  if is_t3 "$framed"; then
     ok "framed / serves T3 Code"
   else
     bad "framed / did not serve T3 Code"
   fi
 
   embed="$(body_of "$base/?embed=1")"
-  if grep -q '<html lang="en"' <<<"$embed"; then
+  if is_t3 "$embed"; then
     ok "/?embed=1 serves T3 Code"
   else
     bad "/?embed=1 did not serve T3 Code"
@@ -178,7 +182,7 @@ else
   fi
 
   # Native and headless clients send no Sec-Fetch-Dest; they must reach T3.
-  if grep -q '<html lang="en"' <<<"$(body_of "$base/")"; then
+  if is_t3 "$(body_of "$base/")"; then
     ok "/ without fetch metadata serves T3 Code (API clients)"
   else
     bad "/ without fetch metadata served the dashboard; API clients would break"
@@ -197,11 +201,16 @@ note "T3 proxy"
 if [ "$managed" = 1 ]; then
   expect "T3 Code direct on $service_port" "$(status_of "http://$host:$service_port/")" 200
 else
-  # Proof the proxied origin really is the dev server rather than a build.
-  if grep -q '@vite/client' <<<"$(body_of -H 'Sec-Fetch-Dest: iframe' "$base/")"; then
+  # The shell proxies the stub. An instance that uses the dev runner of the
+  # fork proxies a Vite address. The two results are correct for an instance
+  # that systemd does not manage.
+  probe="$(body_of -H 'Sec-Fetch-Dest: iframe' "$base/")"
+  if grep -q '@vite/client' <<<"$probe"; then
     ok "proxied origin is the dev server (hot reload active)"
+  elif grep -q 'name="t3code-stub"' <<<"$probe"; then
+    ok "proxied origin is the T3 Code stub (dashboard shell)"
   else
-    bad "proxied origin does not look like the dev server"
+    bad "proxied origin is neither the dev server nor the stub"
   fi
 fi
 
@@ -226,6 +235,13 @@ else
   case "$upgrade" in
     101) ok "WebSocket upgrade proxied and accepted (HTTP 101)" ;;
     401) bad "WebSocket upgrade rejected as unauthenticated (HTTP 401)" ;;
+    # The stub has no WebSocket. But the upgrade got to the stub. This test
+    # examines that result.
+    501) if grep -q 'name="t3code-stub"' <<<"${framed:-}"; then
+           ok "WebSocket upgrade reached the stub, which declines it (HTTP 501)"
+         else
+           bad "WebSocket upgrade returned 501"
+         fi ;;
     *) bad "WebSocket upgrade returned $upgrade" ;;
   esac
 

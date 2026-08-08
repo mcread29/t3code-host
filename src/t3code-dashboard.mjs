@@ -1226,6 +1226,77 @@ const JOBS = {
   'self-update': [...SELF_UPDATE_STEPS],
 }
 
+// Where new feature worktrees are created: beside the repo they belong to,
+// not in the deploy or dev worktree.
+const WORKTREE_DIR = process.env.T3CODE_WORKTREE_DIR ??
+  (REPO ? `${REPO.replace(/\/[^/]+$/, '')}/worktrees` : '')
+
+// Creating a worktree and registering it as a project in the deploy console
+// are one action: a worktree you cannot open in T3 Code is half a workflow.
+// The project is added to the deploy data directory, because that is the
+// console you do the work in; the dev runner serves the same worktree from
+// its own home when you ask it to.
+function worktreeCreateSteps(branch, base) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_/.-]*$/.test(branch ?? '')) {
+    throw new Error('invalid branch name')
+  }
+  if (!['upstream/main', 'main', BRANCH, DEV_BRANCH].includes(base)) {
+    throw new Error(`invalid base: ${base}`)
+  }
+  // One directory per branch, with the slashes flattened: nested directories
+  // would strand the parent when a branch is both a prefix and a name.
+  const dir = `${WORKTREE_DIR}/${branch.replaceAll('/', '-')}`
+  return [
+    step('check the branch is free', async (job) => {
+      const exists = await gitOrNull('rev-parse', '--verify', `refs/heads/${branch}`)
+      if (exists !== null) throw new Error(`branch ${branch} already exists`)
+      appendOutput(job, `${branch} is free\n`)
+    }),
+    step('fetch', (job) =>
+      exec(job, 'git', ['-C', REPO, 'fetch', '--prune', '--multiple', 'origin', 'upstream'])),
+    step(`create the worktree from ${base}`, async (job) => {
+      await mkdir(WORKTREE_DIR, { recursive: true })
+      await exec(job, 'git', ['-C', REPO, 'worktree', 'add', dir, '-b', branch, base])
+    }),
+    step('add it as a project in the deploy console', async (job) => {
+      const args = ['project', 'add', dir, '--base-dir', T3_HOME, '--title', branch]
+      try {
+        await exec(job, T3_BIN, args, { cwd: dir })
+      } catch (err) {
+        // A worktree without a project is still usable; say so rather than
+        // failing a job whose main work already succeeded.
+        appendOutput(job, `\n[skipped] could not add the project: ${err.message}\n`)
+      }
+    }),
+  ]
+}
+
+// Removing pairs the two: a project pointing at a deleted worktree is worse
+// than no project at all.
+function worktreeRemoveSteps(path) {
+  if (!path || path === REPO || path === DEV_REPO) {
+    throw new Error('only feature worktrees can be removed')
+  }
+  return [
+    step('verify the worktree', async (job) => {
+      const known = (await listWorktrees()).find((w) => w.path === path)
+      if (!known) throw new Error(`not a worktree of the fork: ${path}`)
+      if (devRunner.worktree === path) throw new Error('the dev server is serving this worktree; stop it first')
+      appendOutput(job, `${known.branch} at ${path}\n`)
+    }),
+    step('remove the project from the deploy console', async (job) => {
+      try {
+        await exec(job, T3_BIN, ['project', 'remove', path, '--base-dir', T3_HOME, '--force'],
+          { cwd: process.env.HOME })
+      } catch (err) {
+        appendOutput(job, `\n[skipped] could not remove the project: ${err.message}\n`)
+      }
+    }),
+    step('remove the worktree', (job) =>
+      exec(job, 'git', ['-C', REPO, 'worktree', 'remove', path])),
+  ]
+}
+
 // Feature-branch jobs take the branch as a parameter: one merges it into dev
 // for staging, the other promotes it straight into deploy. Both work from
 // refs, so the feature worktree itself is never touched.
@@ -1261,11 +1332,17 @@ function branchJobSteps(name, branch) {
   throw new Error(`unknown job: ${name}`)
 }
 
+function parameterizedSteps(name, params) {
+  if (name === 'merge-into-dev' || name === 'promote-branch') {
+    return branchJobSteps(name, params.branch)
+  }
+  if (name === 'worktree-create') return worktreeCreateSteps(params.branch, params.base)
+  if (name === 'worktree-remove') return worktreeRemoveSteps(params.path)
+  return null
+}
+
 function startJob(name, params = {}) {
-  const steps = JOBS[name] ??
-    (name === 'merge-into-dev' || name === 'promote-branch'
-      ? branchJobSteps(name, params.branch)
-      : null)
+  const steps = JOBS[name] ?? parameterizedSteps(name, params)
   if (!steps) throw new Error(`unknown job: ${name}`)
   if (name === 'self-update' ? !HOST_REPO : !REPO) {
     throw new Error(name === 'self-update'
@@ -1450,7 +1527,11 @@ function startMockJob(name, branch) {
   const labels = JOBS[name]?.map((s) => s.label) ??
     (branch && (name === 'merge-into-dev' || name === 'promote-branch')
       ? ['verify branch', `merge ${branch}`, 'push']
-      : [])
+      : name === 'worktree-create'
+        ? ['check the branch is free', 'fetch', 'create the worktree', 'add it as a project']
+        : name === 'worktree-remove'
+          ? ['verify the worktree', 'remove the project', 'remove the worktree']
+          : [])
   if (!labels.length) throw new Error(`unknown job: ${name}`)
   const outcome = mockScenario().jobOutcome ?? 'ok'
 
@@ -1684,6 +1765,8 @@ const server = createServer(async (req, res) => {
       try {
         const job = startJob(url.searchParams.get('name'), {
           branch: url.searchParams.get('branch') ?? undefined,
+          base: url.searchParams.get('base') ?? undefined,
+          path: url.searchParams.get('path') ?? undefined,
         })
         return json(res, 200, { id: job.id, name: job.name })
       } catch (err) {
@@ -2117,6 +2200,27 @@ const PAGE = String.raw`<!doctype html>
   .confirm-actions { display:flex; gap:.5rem; justify-content:flex-end; padding:.8rem .95rem .9rem; }
   .confirm-actions button { flex:0 0 auto; min-width:96px; }
 
+  dialog#new-wt {
+    width:min(420px, 90vw); padding:0; color:var(--text);
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    box-shadow:0 24px 60px -20px #000;
+  }
+  dialog#new-wt::backdrop { background:rgba(0,0,0,.6); }
+  .field {
+    display:block; padding:.7rem .95rem 0; color:var(--faint);
+    font-size:.68rem; letter-spacing:.08em; text-transform:uppercase;
+  }
+  .field input, .field select {
+    display:block; width:100%; margin-top:.3rem; padding:.4rem .55rem;
+    background:var(--raised); color:var(--text); font:inherit; font-size:.78rem;
+    letter-spacing:0; text-transform:none;
+    border:1px solid var(--line); border-radius:6px;
+  }
+  .field input:focus-visible, .field select:focus-visible {
+    outline:2px solid var(--accent); outline-offset:1px;
+  }
+  .field input:invalid:not(:placeholder-shown) { border-color:#5c2a2a; }
+
   /* release notes / commits ------------------------------------------------ */
   #notes { margin-top:.8rem; border-top:1px solid var(--line-soft); padding-top:.3rem;
            max-height:24rem; overflow:auto; }
@@ -2276,6 +2380,7 @@ const PAGE = String.raw`<!doctype html>
                the dev tab; the icons merge it into dev or promote it into
                deploy. Dev itself stays the staging pipeline below. -->
           <div class="steps" id="wt-list" hidden aria-label="Feature worktrees"></div>
+          <button class="foldout" id="wt-new" style="margin-top:.4rem">+ new worktree</button>
           <div class="steps" aria-label="Dev branch actions">
             <button class="step" id="job-merge-dev"><span class="glyph"></span>
               <span class="lbl">dev &larr; deploy</span><span class="meta" id="meta-merge-dev"></span></button>
@@ -2313,6 +2418,30 @@ const PAGE = String.raw`<!doctype html>
       </section>
     </div>
   </aside>
+
+  <!-- New feature worktree: a branch name, and what it is cut from. The base
+       is the intent — upstream/main for work meant as a pull request, deploy
+       for changes that only ever run here. -->
+  <dialog id="new-wt">
+    <div class="modal-head"><span>new worktree</span></div>
+    <form method="dialog" id="new-wt-form">
+      <label class="field">branch
+        <input id="new-wt-branch" name="branch" placeholder="fix/no-autoscroll"
+          pattern="[A-Za-z0-9][A-Za-z0-9_/.-]*" required autocomplete="off">
+      </label>
+      <label class="field">based on
+        <select id="new-wt-base" name="base">
+          <option value="upstream/main">upstream/main — for a pull request</option>
+          <option value="deploy">deploy — for this fork only</option>
+        </select>
+      </label>
+      <p class="confirm-body" id="new-wt-hint"></p>
+      <div class="confirm-actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="create" class="primary">Create</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="confirm">
     <div class="modal-head">
@@ -2999,11 +3128,12 @@ const JOB_BUTTONS = [
   'job-self-update',
 ]
 
-async function startJob(name, branch) {
+const startJob = (name, branch) => startJobWith(name, branch ? { branch } : {})
+
+async function startJobWith(name, extra = {}) {
   for (const id of JOB_BUTTONS) $(id).disabled = true
   try {
-    const params = new URLSearchParams({ name })
-    if (branch) params.set('branch', branch)
+    const params = new URLSearchParams({ name, ...extra })
     const res = await fetch('/_dash/job?' + params, { method: 'POST', headers: { 'x-token': TOKEN } })
     const r = await res.json()
     if (!res.ok) throw new Error(r.error ?? 'could not start')
@@ -3092,6 +3222,9 @@ function renderWorktrees() {
       (forkBusy || w.inDev || !w.clean ? ' disabled' : '') + '>⇣</button>' +
       '<button class="icon wt-promote" data-branch="' + esc(w.branch) + '" title="Promote into deploy"' +
       (forkBusy || w.aheadDeploy === 0 ? ' disabled' : '') + '>⇡</button>' +
+      '<button class="icon danger wt-remove" data-path="' + esc(w.path) + '" data-branch="' +
+      esc(w.branch) + '" title="Remove the worktree and its project"' +
+      (forkBusy || serving ? ' disabled' : '') + '>✕</button>' +
       '</div>'
   }).join('')
 }
@@ -3131,7 +3264,41 @@ $('wt-list').onclick = async (e) => {
       'Merge ' + branch + ' into deploy, and push deploy. This builds nothing and restarts nothing.')) {
       startJob('promote-branch', branch)
     }
+    return
   }
+  const remove = e.target.closest('.wt-remove')
+  if (remove && !remove.disabled) {
+    const branch = remove.dataset.branch
+    if (await confirmAction('remove ' + branch,
+      'Remove this worktree and its project in the deploy console. The branch itself is kept, so nothing committed is lost.')) {
+      startJobWith('worktree-remove', { path: remove.dataset.path })
+    }
+  }
+}
+
+// The new-worktree dialog: a branch name and what it is cut from. The hint
+// follows the base, because that choice is the intent behind the branch.
+const newWorktreeDialog = $('new-wt')
+const describeBase = () => {
+  $('new-wt-hint').textContent = $('new-wt-base').value === 'upstream/main'
+    ? 'Cut from current upstream, so the branch stays clean for a pull request.'
+    : 'Cut from deploy, so it builds on this fork. For changes you only run here.'
+}
+$('new-wt-base').onchange = describeBase
+
+$('wt-new').onclick = () => {
+  $('new-wt-branch').value = ''
+  describeBase()
+  newWorktreeDialog.showModal()
+  $('new-wt-branch').focus()
+}
+newWorktreeDialog.onclick = (e) => { if (e.target === newWorktreeDialog) newWorktreeDialog.close() }
+$('new-wt-form').onsubmit = () => {
+  // A dialog form submits and closes itself; only act on the create button.
+  if (newWorktreeDialog.returnValue === 'cancel') return
+  const branch = $('new-wt-branch').value.trim()
+  if (!branch) return
+  startJobWith('worktree-create', { branch, base: $('new-wt-base').value })
 }
 
 // ---------------------------------------------------------------------------

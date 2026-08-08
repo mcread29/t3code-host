@@ -294,7 +294,10 @@ async function forkStatus() {
     readFile(`${REPO}/apps/server/${asset}`).then(() => true).catch(() => false),
   ))).every(Boolean)
 
-  const tip = await gitOrNull('rev-parse', '--short', BRANCH)
+  const [tip, worktrees] = await Promise.all([
+    gitOrNull('rev-parse', '--short', BRANCH),
+    worktreeStatus(),
+  ])
   const conflicts = [...new Set([...syncPreview.conflicts, ...deployPreview.conflicts, ...devPreview.conflicts])]
 
   return {
@@ -323,6 +326,7 @@ async function forkStatus() {
     },
     clean: syncPreview.clean && deployPreview.clean,
     conflicts,
+    worktrees,
   }
 }
 
@@ -382,6 +386,54 @@ async function selfStatus() {
     managed: Boolean(DASH_UNIT),
     active: activeJob && jobs.get(activeJob)?.state === 'running' ? activeJob : null,
   }
+}
+
+// The linked worktrees of the fork, feature worktrees included. The deploy
+// checkout itself is not listed: it is the release, served by the installed
+// build, and never by the dev runner.
+async function listWorktrees() {
+  const out = await gitOrNull('worktree', 'list', '--porcelain')
+  if (!out) return []
+  const items = []
+  let current = null
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      current = { path: line.slice('worktree '.length) }
+      items.push(current)
+    } else if (line.startsWith('branch refs/heads/') && current) {
+      current.branch = line.slice('branch refs/heads/'.length)
+    } else if (line === 'detached' && current) {
+      current.detached = true
+    }
+  }
+  return items.filter((w) => w.path !== REPO && w.branch && w.branch !== BRANCH && !w.detached)
+}
+
+// Per-worktree state for the sidebar: what the branch adds over deploy,
+// whether dev already contains it, and whether merging it anywhere would
+// conflict. All of it from refs, so a feature worktree's own dirtiness only
+// shows as a flag and never blocks reading the rest.
+async function worktreeStatus() {
+  const worktrees = await listWorktrees()
+  return Promise.all(worktrees.map(async (w) => {
+    const [head, dirty, ahead, inDev] = await Promise.all([
+      gitOrNull('rev-parse', '--short', w.branch),
+      gitInOrNull(w.path, 'status', '--porcelain'),
+      gitOrNull('rev-list', '--count', `${BRANCH}..${w.branch}`),
+      gitOrNull('merge-base', '--is-ancestor', w.branch, DEV_BRANCH).then((r) => r !== null),
+    ])
+    const isDev = w.branch === DEV_BRANCH
+    const preview = !isDev && !inDev
+      ? await mergePreview(DEV_BRANCH, w.branch)
+      : { clean: true, conflicts: [] }
+    return {
+      path: w.path, branch: w.branch, head, isDev,
+      dirty: Boolean(dirty),
+      aheadDeploy: Number(ahead ?? 0),
+      inDev: Boolean(inDev),
+      clean: preview.clean, conflicts: preview.conflicts,
+    }
+  }))
 }
 
 async function incomingCommits() {
@@ -572,6 +624,8 @@ const devRunner = {
   output: '',
   error: null,
   child: null,
+  worktree: null,
+  servingBranch: null,
   // Whether the exit about to happen was asked for. Without this, a crash
   // after a successful start reports as a clean stop and no one learns why
   // the dev console just went away.
@@ -583,6 +637,9 @@ async function devRunnerStatus() {
     configured: Boolean(DEV_REPO),
     repo: DEV_REPO || null,
     branch: DEV_BRANCH,
+    // Which worktree the runner serves, and the branch checked out there.
+    worktree: devRunner.worktree,
+    servingBranch: devRunner.servingBranch,
     state: devRunner.state,
     origin: devRunner.origin,
     error: devRunner.error,
@@ -609,13 +666,22 @@ function readRunnerAnnouncements() {
   }
 }
 
-function startDevRunner() {
+async function startDevRunner(worktree) {
   if (!DEV_REPO) throw new Error('no development worktree is configured')
   if (devRunner.state === 'starting' || devRunner.state === 'running') return devRunnerStatus()
 
+  // The runner serves the dev worktree by default, or any listed feature
+  // worktree. Each worktree brings its own data directory and ports, so which
+  // one runs changes only what the dev console shows.
+  const target = worktree ?? DEV_REPO
+  if (target !== DEV_REPO && !(await listWorktrees()).some((w) => w.path === target)) {
+    throw new Error(`not a worktree of the fork: ${target}`)
+  }
+  const servingBranch = await gitInOrNull(target, 'rev-parse', '--abbrev-ref', 'HEAD')
+
   Object.assign(devRunner, {
     state: 'starting', origin: null, home: null, output: '', error: null,
-    stopRequested: false,
+    stopRequested: false, worktree: target, servingBranch,
   })
 
   // Nothing of this dashboard's own T3 configuration may leak into the
@@ -632,7 +698,7 @@ function startDevRunner() {
   // own process group. If it does not, the stop below cannot reach the
   // children.
   const child = spawn(PNPM_BIN, ['dev'], {
-    cwd: DEV_REPO,
+    cwd: target,
     env,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -661,6 +727,7 @@ function startDevRunner() {
     Object.assign(devRunner, {
       state: wanted ? 'stopped' : 'failed',
       pid: null, origin: null, child: null,
+      worktree: null, servingBranch: null,
       error: wanted ? null
         : started ? `dev runner exited unexpectedly (${signal ?? `code ${code}`})`
         : `dev runner exited with code ${code}`,
@@ -1159,8 +1226,46 @@ const JOBS = {
   'self-update': [...SELF_UPDATE_STEPS],
 }
 
-function startJob(name) {
-  const steps = JOBS[name]
+// Feature-branch jobs take the branch as a parameter: one merges it into dev
+// for staging, the other promotes it straight into deploy. Both work from
+// refs, so the feature worktree itself is never touched.
+function branchJobSteps(name, branch) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_/.-]*$/.test(branch ?? '')) {
+    throw new Error('invalid branch name')
+  }
+  const verify = step('verify branch', async (job) => {
+    await git('rev-parse', '--verify', `refs/heads/${branch}`)
+    appendOutput(job, `${branch} exists\n`)
+  })
+  if (name === 'merge-into-dev') {
+    if (branch === DEV_BRANCH) throw new Error(`${DEV_BRANCH} cannot merge into itself`)
+    return [
+      verify,
+      guardDev,
+      step(`merge ${branch} into ${DEV_BRANCH}`, (job) => mergeInto(job, DEV_REPO, branch, DEV_BRANCH)),
+      step(`push ${DEV_BRANCH}`, async (job) => {
+        const pushed = await gitInOrNull(DEV_REPO, 'push', 'origin', DEV_BRANCH)
+        appendOutput(job, pushed === null ? `[skipped] could not push ${DEV_BRANCH}\n` : `pushed ${DEV_BRANCH}\n`)
+      }),
+    ]
+  }
+  if (name === 'promote-branch') {
+    if (branch === BRANCH) throw new Error(`${BRANCH} cannot merge into itself`)
+    return [
+      verify,
+      guardDeploy,
+      step(`merge ${branch} into ${BRANCH}`, (job) => mergeInto(job, REPO, branch, BRANCH)),
+      step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
+    ]
+  }
+  throw new Error(`unknown job: ${name}`)
+}
+
+function startJob(name, params = {}) {
+  const steps = JOBS[name] ??
+    (name === 'merge-into-dev' || name === 'promote-branch'
+      ? branchJobSteps(name, params.branch)
+      : null)
   if (!steps) throw new Error(`unknown job: ${name}`)
   if (name === 'self-update' ? !HOST_REPO : !REPO) {
     throw new Error(name === 'self-update'
@@ -1254,6 +1359,18 @@ const MOCK_SCENARIOS = {
   'service-stopped': { status: { active: 'inactive', sub: 'dead', pid: null, startedAt: null, origin: null } },
   'service-failed': { status: { active: 'failed', sub: 'failed', pid: null, startedAt: null, origin: null, restarts: '4' } },
   'dashboard-behind': { self: { behind: 2 } },
+  'feature-branches': {
+    fork: {
+      worktrees: [
+        { path: '/mock/wt/no-autoscroll', branch: 'fix/no-autoscroll', head: 'ab34cd5', isDev: false,
+          dirty: false, aheadDeploy: 2, inDev: false, clean: true, conflicts: [] },
+        { path: '/mock/wt/notifications', branch: 'feat/notifications', head: 'ef56ab7', isDev: false,
+          dirty: true, aheadDeploy: 5, inDev: true, clean: true, conflicts: [] },
+        { path: '/mock/wt/branding', branch: 'fork/branding', head: '9a8b7c6', isDev: false,
+          dirty: false, aheadDeploy: 1, inDev: false, clean: false, conflicts: ['apps/web/src/theme.ts'] },
+      ],
+    },
+  },
   'npm-mode': {
     npm: true,
     latest: { installed: '0.0.32-nightly.20260801.990', latest: '0.0.33-nightly.20260806.1010', upToDate: false },
@@ -1275,6 +1392,7 @@ function mockFork() {
     head: 'ab12cd3', tip: 'ab12cd3', built: 'ab12cd3', deployed: 'ab12cd3',
     hasBuild: true, needsRebuild: false, needsDeploy: false, dirty: false,
     mainBehind: 0, deployBehind: 0, clean: true, conflicts: [],
+    worktrees: [],
     ...rest,
     commits,
     dev: {
@@ -1302,8 +1420,14 @@ function mockStatus() {
 }
 
 function mockRunnerStatus() {
+  const worktree = mockState.runner === 'stopped' || mockState.runner === 'failed'
+    ? null : mockState.runnerWorktree ?? '/mock/t3code/dev'
+  const branch = worktree
+    ? (mockScenario().fork?.worktrees ?? []).find((w) => w.path === worktree)?.branch ?? 'dev'
+    : null
   return {
     configured: true, repo: '/mock/t3code/dev', branch: 'dev',
+    worktree, servingBranch: branch,
     state: mockState.runner,
     origin: mockState.runner === 'running' ? 'http://localhost:1' : null,
     error: null, output: '',
@@ -1317,13 +1441,16 @@ function mockRunnerStatus() {
 // A fake job streams output on a timer and walks the real step labels, so the
 // polling, the running marker, and the failure colours all exercise the same
 // paths a real build does -- just in seconds instead of minutes.
-function startMockJob(name) {
+function startMockJob(name, branch) {
   if (mockState.job?.state === 'running') {
     const err = new Error('a job is already running')
     err.conflict = true
     throw err
   }
-  const labels = (JOBS[name] ?? []).map((s) => s.label)
+  const labels = JOBS[name]?.map((s) => s.label) ??
+    (branch && (name === 'merge-into-dev' || name === 'promote-branch')
+      ? ['verify branch', `merge ${branch}`, 'push']
+      : [])
   if (!labels.length) throw new Error(`unknown job: ${name}`)
   const outcome = mockScenario().jobOutcome ?? 'ok'
 
@@ -1410,6 +1537,7 @@ function mockApi(req, res, url) {
     if (post) {
       const action = url.searchParams.get('action')
       if (action === 'start' && mockState.runner === 'stopped') {
+        mockState.runnerWorktree = url.searchParams.get('worktree') ?? '/mock/t3code/dev'
         mockState.runner = 'starting'
         setTimeout(() => { if (mockState.runner === 'starting') mockState.runner = 'running' }, 1500).unref()
       } else if (action === 'stop' && mockState.runner === 'running') {
@@ -1421,7 +1549,7 @@ function mockApi(req, res, url) {
   }
   if (post && path === '/_dash/job') {
     try {
-      const job = startMockJob(url.searchParams.get('name'))
+      const job = startMockJob(url.searchParams.get('name'), url.searchParams.get('branch'))
       return json(res, 200, { id: job.id, name: job.name })
     } catch (err) {
       return json(res, err.conflict ? 409 : 400, { error: err.message })
@@ -1529,7 +1657,9 @@ const server = createServer(async (req, res) => {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
       const action = url.searchParams.get('action')
       try {
-        if (action === 'start') return json(res, 200, await startDevRunner())
+        if (action === 'start') {
+          return json(res, 200, await startDevRunner(url.searchParams.get('worktree') ?? undefined))
+        }
         if (action === 'stop') return json(res, 200, await stopDevRunner())
       } catch (err) {
         return json(res, 400, { error: err.message })
@@ -1552,7 +1682,9 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/_dash/job') {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
       try {
-        const job = startJob(url.searchParams.get('name'))
+        const job = startJob(url.searchParams.get('name'), {
+          branch: url.searchParams.get('branch') ?? undefined,
+        })
         return json(res, 200, { id: job.id, name: job.name })
       } catch (err) {
         return json(res, err.conflict ? 409 : 400, { error: err.message })
@@ -1830,8 +1962,22 @@ const PAGE = String.raw`<!doctype html>
   .step:disabled { opacity:1; color:var(--faint); cursor:default; }
   /* Only a step that can actually run reads as a control: it is brighter,
      and it carries a chevron. The rest are status lines. */
-  .step:not(:disabled) { color:var(--text); cursor:pointer; }
-  .step:not(:disabled)::after { content:'›'; flex:none; color:var(--accent); }
+  button.step:not(:disabled) { color:var(--text); cursor:pointer; }
+  button.step:not(:disabled)::after { content:'›'; flex:none; color:var(--accent); }
+
+  /* A worktree row: the branch is the serve action, and the two icons move
+     the branch into dev or deploy. The row itself is a plain container. */
+  div.step { cursor:default; }
+  .wt-name {
+    flex:none; min-width:0; padding:0; border:0; background:none;
+    font:inherit; font-size:.78rem; color:var(--text); cursor:pointer;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .wt-name:hover:not(:disabled) { color:var(--accent); background:none; border:0; }
+  .wt-name:disabled { color:var(--faint); cursor:default; }
+  div.step .meta { margin-left:auto; }
+  div.step button.icon { width:22px; height:22px; font-size:.72rem; margin:-2px 0; }
+  div.step.serving .glyph::before { content:'●'; color:var(--green); }
   .step .glyph { flex:none; width:1rem; text-align:center; color:var(--faint); }
   .step .glyph::before { content:'○'; }
   .step.complete .glyph::before { content:'✓'; color:var(--green); }
@@ -1856,6 +2002,7 @@ const PAGE = String.raw`<!doctype html>
     color:var(--faint); font-size:.75rem; line-height:1.55;
   }
   .dev-line { color:var(--faint); font-size:.72rem; margin:0 0 .6rem; word-break:break-all; }
+  .steps + .steps { margin-top:.45rem; }
 
   /* Each section keeps its natural height. The open foldout takes the
      remaining space. The body of the foldout scrolls, and not the section.
@@ -2125,6 +2272,10 @@ const PAGE = String.raw`<!doctype html>
         <div class="dev-empty" id="dev-empty" hidden>No development worktree is configured.</div>
         <div id="dev-content">
           <div class="dev-line" id="dev-line">—</div>
+          <!-- One row per feature worktree: click the branch to serve it on
+               the dev tab; the icons merge it into dev or promote it into
+               deploy. Dev itself stays the staging pipeline below. -->
+          <div class="steps" id="wt-list" hidden aria-label="Feature worktrees"></div>
           <div class="steps" aria-label="Dev branch actions">
             <button class="step" id="job-merge-dev"><span class="glyph"></span>
               <span class="lbl">dev &larr; deploy</span><span class="meta" id="meta-merge-dev"></span></button>
@@ -2595,6 +2746,9 @@ function renderFork(f) {
   // The path answers "where do I go to work on this"; the ahead/behind counts
   // already live in the two step metas below.
   $('dev-line').innerHTML = esc(f.dev.repo || '—') + (f.dev.dirty ? flag('dirty') : '')
+  lastWorktrees = f.worktrees ?? []
+  forkBusy = busy
+  renderWorktrees()
   $('job-main').disabled = busy || f.mainBehind === 0
   $('job-merge-deploy').disabled = busy || f.dirty || !f.clean || f.mainBehind > 0 || f.deployBehind === 0
   $('job-merge-dev').disabled = busy || !hasDev || f.dev.dirty || f.dev.behind === 0
@@ -2845,10 +2999,12 @@ const JOB_BUTTONS = [
   'job-self-update',
 ]
 
-async function startJob(name) {
+async function startJob(name, branch) {
   for (const id of JOB_BUTTONS) $(id).disabled = true
   try {
-    const res = await fetch('/_dash/job?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const params = new URLSearchParams({ name })
+    if (branch) params.set('branch', branch)
+    const res = await fetch('/_dash/job?' + params, { method: 'POST', headers: { 'x-token': TOKEN } })
     const r = await res.json()
     if (!res.ok) throw new Error(r.error ?? 'could not start')
     pollJob(r.id)
@@ -2904,6 +3060,81 @@ for (const [id, name, title, message] of JOB_UI) {
 }
 
 // ---------------------------------------------------------------------------
+// feature worktrees
+// ---------------------------------------------------------------------------
+
+// One row per feature worktree. The branch name serves that worktree on the
+// dev tab; the icons merge it into dev (staging) or promote it into deploy.
+// Dev itself stays out of this list: its pipeline is the two rows below.
+let lastWorktrees = []
+let forkBusy = false
+let servingWorktree = null
+
+function renderWorktrees() {
+  const rows = lastWorktrees.filter((w) => !w.isDev)
+  const list = $('wt-list')
+  list.hidden = !rows.length
+  list.innerHTML = rows.map((w) => {
+    const serving = servingWorktree === w.path
+    const meta = [
+      w.aheadDeploy + ' ahead',
+      w.inDev ? 'in dev' : null,
+      w.dirty ? 'dirty' : null,
+      !w.clean ? 'conflicts' : null,
+    ].filter(Boolean).join(' · ')
+    const warn = w.dirty || !w.clean
+    return '<div class="step wt' + (serving ? ' serving' : '') + '">' +
+      '<span class="glyph"></span>' +
+      '<button class="wt-name" data-path="' + esc(w.path) + '" data-branch="' + esc(w.branch) + '"' +
+      ' title="Serve ' + esc(w.branch) + ' on the dev tab">' + esc(w.branch) + '</button>' +
+      '<span class="meta' + (warn ? ' warn' : '') + '">' + esc(meta) + '</span>' +
+      '<button class="icon wt-merge" data-branch="' + esc(w.branch) + '" title="Merge into dev"' +
+      (forkBusy || w.inDev || !w.clean ? ' disabled' : '') + '>⇣</button>' +
+      '<button class="icon wt-promote" data-branch="' + esc(w.branch) + '" title="Promote into deploy"' +
+      (forkBusy || w.aheadDeploy === 0 ? ' disabled' : '') + '>⇡</button>' +
+      '</div>'
+  }).join('')
+}
+
+async function serveWorktree(path, branch) {
+  if (devRunnerState === 'running' || devRunnerState === 'starting') {
+    if (servingWorktree === path) return
+    if (!(await confirmAction('dev server', 'Stop the dev server and serve ' + branch + ' instead? The dev tab reloads.'))) return
+    try { await runnerAction('stop') } catch (err) { return log('dev server failed: ' + err.message) }
+    await settleRunner()
+  }
+  try {
+    await runnerAction('start', path)
+    log('dev server: starting ' + branch)
+  } catch (err) {
+    return log('dev server failed: ' + err.message)
+  }
+  settleRunner()
+}
+
+$('wt-list').onclick = async (e) => {
+  const serve = e.target.closest('.wt-name')
+  const merge = e.target.closest('.wt-merge')
+  const promote = e.target.closest('.wt-promote')
+  if (serve && !serve.disabled) return serveWorktree(serve.dataset.path, serve.dataset.branch)
+  if (merge && !merge.disabled) {
+    const branch = merge.dataset.branch
+    if (await confirmAction('dev ← ' + branch,
+      'Merge ' + branch + ' into dev, and push dev. This builds nothing and restarts nothing.')) {
+      startJob('merge-into-dev', branch)
+    }
+    return
+  }
+  if (promote && !promote.disabled) {
+    const branch = promote.dataset.branch
+    if (await confirmAction('deploy ← ' + branch,
+      'Merge ' + branch + ' into deploy, and push deploy. This builds nothing and restarts nothing.')) {
+      startJob('promote-branch', branch)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // dev runner and the console tabs
 // ---------------------------------------------------------------------------
 
@@ -2944,6 +3175,17 @@ function renderDevRunner(r) {
   devRunnerState = r.state
   const running = r.state === 'running'
   const busy = r.state === 'starting' || r.state === 'stopping'
+
+  // Mark the served worktree in the list, and name the branch on the tab so
+  // "DEV" always says what it is showing.
+  if ((r.worktree ?? null) !== servingWorktree) {
+    servingWorktree = r.worktree ?? null
+    renderWorktrees()
+  }
+  const devTab = document.querySelector('.tab[data-target="dev"]')
+  devTab.textContent = r.servingBranch && r.servingBranch !== r.branch
+    ? 'dev · ' + r.servingBranch
+    : 'dev'
 
   $('dev-runner-state').textContent = r.configured ? r.state : 'no worktree'
   $('dev-runner-dot').className = 'dot mini' +
@@ -2989,24 +3231,35 @@ async function refreshDevRunner() {
   }
 }
 
+async function runnerAction(action, worktree) {
+  const params = new URLSearchParams({ action })
+  if (worktree) params.set('worktree', worktree)
+  const res = await fetch('/_dash/dev-runner?' + params, {
+    method: 'POST', headers: { 'x-token': TOKEN },
+  })
+  const r = await res.json()
+  if (!res.ok) throw new Error(r.error ?? 'could not ' + action)
+  renderDevRunner(r)
+  return r
+}
+
+// Both transitions take seconds. Poll until the state settles.
+async function settleRunner() {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    if (devRunnerState !== 'starting' && devRunnerState !== 'stopping') break
+    await new Promise((settle) => setTimeout(settle, 1000))
+    await refreshDevRunner()
+  }
+}
+
 $('dev-runner-toggle').onclick = async (e) => {
   const btn = e.currentTarget
   const action = devRunnerState === 'running' ? 'stop' : 'start'
   btn.disabled = true
   try {
-    const res = await fetch('/_dash/dev-runner?action=' + action, {
-      method: 'POST', headers: { 'x-token': TOKEN },
-    })
-    const r = await res.json()
-    if (!res.ok) throw new Error(r.error ?? 'could not ' + action)
-    renderDevRunner(r)
+    await runnerAction(action)
     log('dev server: ' + action)
-    // Both transitions take seconds. Poll until the state settles.
-    for (let attempt = 0; attempt < 60; attempt++) {
-      if (devRunnerState !== 'starting' && devRunnerState !== 'stopping') break
-      await new Promise((settle) => setTimeout(settle, 1000))
-      await refreshDevRunner()
-    }
+    await settleRunner()
   } catch (err) {
     log('dev server failed: ' + err.message)
   } finally {

@@ -319,8 +319,8 @@ $settings = New-ScheduledTaskSettingsSet `
 
 $serviceRunner = Join-Path $layout.ScriptDirectory 'Run-Service.ps1'
 $dashboardRunner = Join-Path $layout.ScriptDirectory 'Run-Dashboard.ps1'
-$serviceAction = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -File `"$serviceRunner`" -ConfigPath `"$($layout.ConfigPath)`""
-$dashboardAction = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -File `"$dashboardRunner`" -ConfigPath `"$($layout.ConfigPath)`""
+$serviceAction = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -WindowStyle Hidden -File `"$serviceRunner`" -ConfigPath `"$($layout.ConfigPath)`""
+$dashboardAction = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -WindowStyle Hidden -File `"$dashboardRunner`" -ConfigPath `"$($layout.ConfigPath)`""
 Register-ScheduledTask -TaskPath $layout.TaskPath -TaskName $layout.ServiceTask -Action $serviceAction -Trigger $trigger -Principal $principal -Settings $settings -Description 'Runs the Tailnet T3 Code service.' -Force | Out-Null
 Register-ScheduledTask -TaskPath $layout.TaskPath -TaskName $layout.DashboardTask -Action $dashboardAction -Trigger $trigger -Principal $principal -Settings $settings -Description 'Runs the T3 Code dashboard.' -Force | Out-Null
 

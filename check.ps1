@@ -97,6 +97,11 @@ if (-not $managed) {
         } else {
             Add-Failure "$name does not use a limited interactive token"
         }
+        if ($task -and $task.Actions.Arguments -match '(?:^|\s)-WindowStyle\s+Hidden(?:\s|$)') {
+            Add-Pass "$name hides the PowerShell window"
+        } else {
+            Add-Failure "$name does not hide the PowerShell window"
+        }
         $restartCount = if ($task) { $task.Settings.RestartCount } else { 0 }
         if ($restartCount -gt 0) { Add-Pass "$name restarts after a failure" } else { Add-Failure "$name does not restart after a failure" }
     }

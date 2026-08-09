@@ -39,6 +39,11 @@ shell and test the page in a browser:
 ./dev.sh check    # the end-to-end tests
 ```
 
+```powershell
+.\dev.ps1         # the Windows dashboard shell
+.\dev.ps1 check   # the Windows end-to-end tests
+```
+
 Measure the result. Read `scrollHeight`, `clientHeight`, and the computed
 styles. Do not decide from a screenshot alone. A layout fault can have a cause
 that you cannot see, and a guess costs more time than a measurement.
@@ -48,9 +53,9 @@ no `package.json` and no `node_modules`.
 
 ## Make a machine current
 
-`install.sh` is the one command for a new machine and for an update. It renders
-the units again, it installs the dashboard, and it builds the source only when
-the build is not current.
+Use `install.sh` on Linux. Use `install.ps1` on Windows. Each command installs or updates one machine.
+
+The command renders the service files again. It installs the dashboard. It builds the source only when necessary.
 
 ```bash
 git pull
@@ -125,10 +130,12 @@ correct backend with `--base-dir`. A credential from one backend gives an HTTP
 
 | File | Function |
 | --- | --- |
-| `dev.sh` | Runs the dashboard shell with the stub. |
-| `check.sh` | Tests one instance. |
-| `install.sh` | Installs one instance. |
-| `lib/guard.sh` | Protects the production instance. |
+| `dev.sh`, `dev.ps1` | Run the dashboard shell with the stub. |
+| `check.sh`, `check.ps1` | Test one instance. |
+| `install.sh`, `install.ps1` | Install one instance. |
+| `lib/guard.sh`, `lib/Guard.ps1` | Protect the production instance. |
+| `lib/Windows.ps1` | Give shared Windows functions. |
+| `windows/` | Run the Windows tasks. |
 | `src/t3code-dashboard.mjs` | The dashboard, the proxy, and the page. |
 | `src/dev-stub-t3.mjs` | The substitute for T3 Code, for `./dev.sh`. |
 | `systemd/*.in` | The templates for the units. |

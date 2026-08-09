@@ -17,12 +17,14 @@ launcher.
 
 ## Requirements
 
-- Linux with systemd user services
-- Node.js, npm, and pnpm
-- Git
-- Tailscale, connected to a tailnet with MagicDNS
-- Rust and `cargo` for the resource monitor (optional)
-- GitHub CLI (`gh`) for the dashboard changelog (optional)
+- Linux with systemd user services, or Windows 10 or 11 with PowerShell 7.
+- Node.js, npm, and pnpm.
+- Git.
+- Tailscale, connected to a tailnet with MagicDNS.
+- Rust and `cargo` for the resource monitor (optional).
+- GitHub CLI (`gh`) for the dashboard changelog (optional).
+
+Windows uses limited user tasks. The tasks start after the user signs in.
 
 ## Install for the first time
 
@@ -36,18 +38,28 @@ source. The build takes some minutes.
    cd t3code-host
    ```
 
-2. Install the production instance:
+2. Install the production instance on Linux:
 
    ```bash
    T3CODE_INSTANCE=production ./install.sh
    ```
 
+   Install the production instance on Windows:
+
+   ```powershell
+   $env:T3CODE_INSTANCE = 'production'
+   .\install.ps1
+   ```
+
 3. Type `production` when the script asks you.
 
-4. Make sure that the instance is correct:
+4. Check the Linux instance with `check.sh`.
 
-   ```bash
-   T3CODE_INSTANCE=production ./check.sh
+   Check the Windows instance with these commands:
+
+   ```powershell
+   $env:T3CODE_INSTANCE = 'production'
+   .\check.ps1
    ```
 
 You must give the instance name. A command without a name stops with an error.
@@ -58,13 +70,29 @@ The installer does these steps:
 1. It installs the global `t3` package. This package is the fallback.
 2. It clones the fork. It builds the fork. It installs the build.
 3. It removes the loopback service of T3 Code, if this service is present.
-4. It installs a systemd user service. This service runs T3 Code on the Tailnet
-   IPv4 address at port 4123.
+4. It installs a systemd service or Windows task. It runs T3 Code on the
+   Tailnet IPv4 address at port 4123.
 5. It installs the dashboard on the same address at port 4124.
 6. It publishes the dashboard with Tailscale Serve on HTTPS port 443.
 
 If the source build fails, the npm package stays. The service continues to run.
 Do the build again from the dashboard.
+
+### Windows commands
+
+Each PowerShell script has the same function as its shell script:
+
+| Linux | Windows |
+| --- | --- |
+| `install.sh` | `install.ps1` |
+| `units.sh` | `units.ps1` |
+| `update.sh` | `update.ps1` |
+| `refresh-dashboard.sh` | `refresh-dashboard.ps1` |
+| `uninstall.sh` | `uninstall.ps1` |
+| `check.sh` | `check.ps1` |
+| `dev.sh` | `dev.ps1` |
+
+Set the required variables in the PowerShell process before each command.
 
 The default package channel is `nightly`. To use the stable releases, set the
 channel:
@@ -494,10 +522,20 @@ the production instance. The browser then loses its scopes. Use
 
 ## Manage the services
 
+Use systemd on Linux:
+
 ```bash
 systemctl --user status t3code.service t3code-dashboard.service
 systemctl --user restart t3code.service t3code-dashboard.service
 journalctl --user -u t3code.service -u t3code-dashboard.service -f
+```
+
+Use Task Scheduler on Windows:
+
+```powershell
+Get-ScheduledTask -TaskName 'T3CodeHost-*'
+Start-ScheduledTask -TaskName 'T3CodeHost-t3code'
+Stop-ScheduledTask -TaskName 'T3CodeHost-t3code'
 ```
 
 T3 Code also writes its messages to this file:
@@ -510,15 +548,17 @@ T3 Code also writes its messages to this file:
 
 | Path | Contents |
 | --- | --- |
-| `install.sh` | Installs or updates one instance. |
-| `refresh-dashboard.sh` | Updates the dashboard of one instance only. |
-| `update.sh` | Gets the upstream changes, then builds and installs them. |
-| `uninstall.sh` | Removes the units of one instance. |
-| `check.sh` | Tests one instance. |
-| `dev.sh` | Runs the dashboard shell with the stub. |
-| `units.sh` | Makes the units and the dashboard current. It does not touch T3 Code. |
-| `AGENTS.md` | The rules for an agent that works here. |
-| `lib/guard.sh` | Protects the production instance. |
+| `install.sh`, `install.ps1` | Install or update one instance. |
+| `refresh-dashboard.sh`, `refresh-dashboard.ps1` | Update one dashboard only. |
+| `update.sh`, `update.ps1` | Get, build, and install upstream changes. |
+| `uninstall.sh`, `uninstall.ps1` | Remove one instance. |
+| `check.sh`, `check.ps1` | Test one instance. |
+| `dev.sh`, `dev.ps1` | Run the dashboard shell with the stub. |
+| `units.sh`, `units.ps1` | Update service files without a build. |
+| `AGENTS.md` | Give the rules for an agent that works here. |
+| `lib/guard.sh`, `lib/Guard.ps1` | Protect the production instance. |
+| `lib/Windows.ps1` | Give shared Windows functions. |
+| `windows/` | Run the Windows tasks. |
 | `src/t3code-dashboard.mjs` | The dashboard and the T3 Code proxy. |
 | `src/dev-stub-t3.mjs` | The substitute for T3 Code, for `./dev.sh`. |
 | `src/t3code-serve-tailnet` | Starts T3 Code on the Tailnet address. |

@@ -3,9 +3,10 @@
 // Binds to the tailnet address, same trust boundary as t3code itself.
 
 import { createServer, request as httpRequest } from 'node:http'
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
@@ -14,11 +15,14 @@ const PORT = Number(process.env.T3CODE_DASH_PORT ?? 4124)
 // A second listener that always proxies the dev runner, so the dev console
 // has an origin of its own and can be mounted beside the deploy console.
 const DEV_CONSOLE_PORT = Number(process.env.T3CODE_DEV_CONSOLE_PORT ?? PORT + 1)
-// An empty unit means this instance is not run by systemd -- the no-install
-// dev mode, where the fork's own dev runner owns the process. Service control
-// and the build jobs do not apply there.
+// An empty unit means that a service manager does not run this instance.
+// The dev server owns the process in the no-install mode.
 const UNIT = process.env.T3CODE_UNIT ?? 't3code.service'
 const MANAGED = UNIT !== ''
+const SERVICE_MANAGER = process.env.T3CODE_SERVICE_MANAGER ?? 'systemd'
+const SCHEDULED_TASK = SERVICE_MANAGER === 'scheduled-task'
+const WINDOWS = process.platform === 'win32'
+const USER_HOME = process.env.HOME ?? process.env.USERPROFILE ?? ''
 
 // Points the proxy at a running dev server instead of the installed build's
 // runtime file. In the fork's dev mode the browser origin is the web dev
@@ -28,6 +32,7 @@ const T3_BIN = process.env.T3CODE_BIN ?? 't3'
 const NPM_BIN = process.env.NPM_BIN ?? 'npm'
 const NPM_PREFIX = process.env.NPM_PREFIX ?? ''
 const PNPM_BIN = process.env.PNPM_BIN ?? 'pnpm'
+const POWERSHELL_BIN = process.env.T3CODE_PWSH ?? 'pwsh.exe'
 const CHANNEL = process.env.T3CODE_CHANNEL ?? 'nightly'
 
 // Source mode. When T3CODE_REPO is unset the dashboard keeps its original
@@ -36,10 +41,19 @@ const REPO = process.env.T3CODE_REPO ?? ''
 const BRANCH = process.env.T3CODE_BRANCH ?? 'deploy'
 const DEV_REPO = process.env.T3CODE_DEV_REPO ?? ''
 const DEV_BRANCH = process.env.T3CODE_DEV_BRANCH ?? 'dev'
-const STATE_DIR = process.env.T3CODE_STATE_DIR ?? `${process.env.HOME}/.local/state/t3code-host`
-const BUILT_SHA_PATH = `${STATE_DIR}/built-sha`
-const DEPLOYED_SHA_PATH = `${STATE_DIR}/deployed-sha`
-const T3_HOME = process.env.T3CODE_HOME ?? `${process.env.HOME}/.t3`
+const STATE_DIR = process.env.T3CODE_STATE_DIR ?? join(USER_HOME, '.local', 'state', 't3code-host')
+const BUILT_SHA_PATH = join(STATE_DIR, 'built-sha')
+const DEPLOYED_SHA_PATH = join(STATE_DIR, 'deployed-sha')
+const T3_HOME = process.env.T3CODE_HOME ?? join(USER_HOME, '.t3')
+
+function samePath(first, second) {
+  if (!first || !second) return first === second
+  const normalize = (value) => {
+    const normalized = resolve(value).replaceAll('\\', '/')
+    return WINDOWS ? normalized.toLowerCase() : normalized
+  }
+  return normalize(first) === normalize(second)
+}
 
 // Serving the page already requires being on the tailnet; this token only
 // stops a random page in your browser from POSTing to us.
@@ -47,12 +61,11 @@ const TOKEN = randomBytes(16).toString('hex')
 
 // On a reboot this can start before tailscaled has an address. Binding the
 // loopback fallback then leaves the dashboard unreachable on the tailnet until
-// someone notices, so wait for a real address and let systemd retry the unit
-// rather than come up on the wrong one.
+// someone notices. Wait for an address and let the service manager retry.
 async function tailnetHost({ attempts = 30, delayMs = 2000 } = {}) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const { stdout } = await run('/usr/bin/tailscale', ['ip', '-4'])
+      const { stdout } = await run('tailscale', ['ip', '-4'])
       const address = stdout.trim().split('\n')[0]
       if (address) return address
     } catch {
@@ -66,18 +79,103 @@ async function tailnetHost({ attempts = 30, delayMs = 2000 } = {}) {
 // Needed before the first request to recognise our own Tailscale Serve mapping.
 const HOST = await tailnetHost()
 if (!HOST) {
-  console.error('no Tailscale IPv4 address after 60s; exiting so systemd retries')
+  console.error('no Tailscale IPv4 address after 60 seconds; the service manager will retry')
   process.exit(1)
 }
+const LISTEN_HOST = process.env.T3CODE_DASH_HOST ?? HOST
 
-async function systemctl(...args) {
-  try {
-    const { stdout } = await run('systemctl', ['--user', ...args])
-    return stdout.trim()
-  } catch (err) {
-    // is-active/is-enabled exit non-zero for inactive units but still print
-    return (err.stdout ?? '').trim() || `error: ${err.message}`
+const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds))
+
+function parseCsvRow(line) {
+  const fields = []
+  let field = ''
+  let quoted = false
+  for (let index = 0; index < line.length; index++) {
+    const character = line[index]
+    if (character === '"') {
+      if (quoted && line[index + 1] === '"') {
+        field += '"'
+        index++
+      } else {
+        quoted = !quoted
+      }
+    } else if (character === ',' && !quoted) {
+      fields.push(field)
+      field = ''
+    } else {
+      field += character
+    }
   }
+  fields.push(field)
+  return fields
+}
+
+async function scheduledTaskDetail(unit = UNIT) {
+  const { stdout } = await run(
+    'schtasks.exe',
+    ['/Query', '/TN', unit, '/FO', 'CSV', '/V', '/NH'],
+    { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
+  )
+  const line = stdout.split(/\r?\n/).find((item) => item.trim())
+  if (!line) throw new Error(`Scheduled Task ${unit} returned no status.`)
+  const fields = parseCsvRow(line)
+  const taskStatus = fields[3]?.trim() ?? ''
+  const taskState = fields[11]?.trim() ?? ''
+  const running = /^running$/i.test(taskStatus)
+  const failed = /failed|could not start/i.test(taskStatus)
+  return {
+    ActiveState: running ? 'active' : failed ? 'failed' : 'inactive',
+    SubState: taskStatus.toLowerCase() || 'unknown',
+    MainPID: '0',
+    ExecMainStartTimestamp: running ? fields[5]?.trim() ?? '' : '',
+    UnitFileState: /^disabled$/i.test(taskState) ? 'disabled' : 'enabled',
+    NRestarts: '0',
+  }
+}
+
+async function executeServiceCommand(command, args, options = {}) {
+  const { stdout, stderr } = await run(command, args, options)
+  return [stdout, stderr].map((value) => value?.trim()).filter(Boolean).join('\n')
+}
+
+async function waitForTaskStop(unit) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      if ((await scheduledTaskDetail(unit)).ActiveState !== 'active') return
+    } catch {
+      return
+    }
+    await sleep(250)
+  }
+  throw new Error(`Scheduled Task ${unit} did not stop.`)
+}
+
+async function serviceAction(action, unit = UNIT, execute = executeServiceCommand) {
+  if (SERVICE_MANAGER === 'systemd') {
+    return execute('systemctl', ['--user', action, unit], {
+      cwd: USER_HOME || undefined,
+      timeout: 30_000,
+    })
+  }
+  if (!SCHEDULED_TASK) throw new Error(`Unknown service manager: ${SERVICE_MANAGER}`)
+
+  const runTaskCommand = (taskAction) => execute(
+    'schtasks.exe',
+    [taskAction === 'start' ? '/Run' : '/End', '/TN', unit],
+    { cwd: USER_HOME || undefined, timeout: 30_000 },
+  )
+  if (action === 'restart') {
+    const output = []
+    const detail = await scheduledTaskDetail(unit)
+    if (detail.ActiveState === 'active') {
+      output.push(await runTaskCommand('stop'))
+      await waitForTaskStop(unit)
+    }
+    output.push(await runTaskCommand('start'))
+    return output.filter(Boolean).join('\n')
+  }
+  if (action === 'start' || action === 'stop') return runTaskCommand(action)
+  throw new Error(`Unknown service action: ${action}`)
 }
 
 async function installedVersion() {
@@ -144,7 +242,7 @@ function isUpToDate(installed, latest) {
 // Releases strictly newer than `from`, up to and including `to`, oldest first.
 async function changelog(from, to) {
   const { stdout } = await run(
-    '/usr/bin/gh',
+    'gh',
     ['api', '--paginate', 'repos/pingdotgg/t3code/releases?per_page=100'],
     { timeout: 45_000, maxBuffer: 32 * 1024 * 1024 },
   )
@@ -291,7 +389,7 @@ async function forkStatus() {
   // worktree can hold correct assets and no record, and a deploy of those
   // assets is correct.
   const hasBuild = (await Promise.all(BUILD_ASSETS.map((asset) =>
-    readFile(`${REPO}/apps/server/${asset}`).then(() => true).catch(() => false),
+    readFile(join(REPO, 'apps', 'server', asset)).then(() => true).catch(() => false),
   ))).every(Boolean)
 
   const [tip, worktrees] = await Promise.all([
@@ -359,7 +457,7 @@ async function selfCopyCurrent() {
   try {
     const [running, source] = await Promise.all([
       readFile(process.argv[1], 'utf8'),
-      readFile(`${HOST_REPO}/src/t3code-dashboard.mjs`, 'utf8'),
+      readFile(join(HOST_REPO, 'src', 't3code-dashboard.mjs'), 'utf8'),
     ])
     return running === source
   } catch {
@@ -406,7 +504,7 @@ async function listWorktrees() {
       current.detached = true
     }
   }
-  return items.filter((w) => w.path !== REPO && w.branch && w.branch !== BRANCH && !w.detached)
+  return items.filter((w) => !samePath(w.path, REPO) && w.branch && w.branch !== BRANCH && !w.detached)
 }
 
 // Per-worktree state for the sidebar: what the branch adds over deploy,
@@ -442,35 +540,39 @@ async function incomingCommits() {
 }
 
 async function serviceDetail() {
-  const raw = await systemctl(
-    'show',
-    UNIT,
-    '-p',
-    'ActiveState',
-    '-p',
-    'SubState',
-    '-p',
-    'MainPID',
-    '-p',
-    'ExecMainStartTimestamp',
-    '-p',
-    'UnitFileState',
-    '-p',
-    'NRestarts',
-  )
-  return Object.fromEntries(
-    raw
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => {
-        const i = line.indexOf('=')
-        return [line.slice(0, i), line.slice(i + 1)]
-      }),
-  )
+  if (SCHEDULED_TASK) return scheduledTaskDetail().catch(() => ({}))
+  if (SERVICE_MANAGER !== 'systemd') throw new Error(`Unknown service manager: ${SERVICE_MANAGER}`)
+
+  try {
+    const { stdout } = await run(
+      'systemctl',
+      [
+        '--user', 'show', UNIT,
+        '-p', 'ActiveState',
+        '-p', 'SubState',
+        '-p', 'MainPID',
+        '-p', 'ExecMainStartTimestamp',
+        '-p', 'UnitFileState',
+        '-p', 'NRestarts',
+      ],
+      { timeout: 30_000 },
+    )
+    return Object.fromEntries(
+      stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const index = line.indexOf('=')
+          return [line.slice(0, index), line.slice(index + 1)]
+        }),
+    )
+  } catch {
+    return {}
+  }
 }
 
-// Without systemd there is no unit to interrogate, so liveness is simply
-// whether the dev server answers.
+// A development process has no managed service. Its response shows its state.
 async function reachable(origin) {
   if (!origin) return false
   try {
@@ -526,7 +628,7 @@ async function status() {
 // console shares the dashboard's session cookie.
 async function serveUrlFor(proxyTarget) {
   try {
-    const { stdout } = await run('/usr/bin/tailscale', ['serve', 'status', '--json'], {
+    const { stdout } = await run('tailscale', ['serve', 'status', '--json'], {
       timeout: 10_000,
       maxBuffer: 8 * 1024 * 1024,
     })
@@ -540,9 +642,9 @@ async function serveUrlFor(proxyTarget) {
   }
 }
 
-const publishedUrl = () => serveUrlFor(`http://${HOST}:${PORT}`)
+const publishedUrl = () => serveUrlFor(`http://${LISTEN_HOST}:${PORT}`)
 // The dev console's own published origin; see the dev console listener below.
-const devPublishedUrl = () => serveUrlFor(`http://${HOST}:${DEV_CONSOLE_PORT}`)
+const devPublishedUrl = () => serveUrlFor(`http://${LISTEN_HOST}:${DEV_CONSOLE_PORT}`)
 
 // ---------------------------------------------------------------------------
 // T3 proxy
@@ -581,7 +683,7 @@ async function t3Origin() {
   if (Date.now() - originCache.at < 5000) return originCache.value
   let value = null
   try {
-    const runtime = JSON.parse(await readFile(`${T3_HOME}/userdata/server-runtime.json`, 'utf8'))
+    const runtime = JSON.parse(await readFile(join(T3_HOME, 'userdata', 'server-runtime.json'), 'utf8'))
     value = runtime.origin ?? null
   } catch {
     value = null
@@ -612,8 +714,8 @@ const HOP_BY_HOP = new Set([
 // The dev server of the fork. It starts on demand. It serves the development
 // worktree from the source with hot reload.
 //
-// This server is not a systemd unit. Only one build owns the global `t3`
-// package, and that build is the deploy build. A second installed service
+// A service manager does not own this server. Only the deploy build owns the
+// global `t3` package. A second installed service
 // causes a conflict. This server is a child of the dashboard. It needs no
 // build. It stops when the dashboard stops.
 const devRunner = {
@@ -647,7 +749,7 @@ async function devRunnerStatus() {
     // Where a browser reaches the dev console: the published HTTPS origin
     // when Serve maps it, else the tailnet address of the listener itself.
     publicUrl: await devPublishedUrl(),
-    directUrl: `http://${HOST}:${DEV_CONSOLE_PORT}`,
+    directUrl: `http://${LISTEN_HOST}:${DEV_CONSOLE_PORT}`,
   }
 }
 
@@ -674,7 +776,7 @@ async function startDevRunner(worktree) {
   // worktree. Each worktree brings its own data directory and ports, so which
   // one runs changes only what the dev console shows.
   const target = worktree ?? DEV_REPO
-  if (target !== DEV_REPO && !(await listWorktrees()).some((w) => w.path === target)) {
+  if (!samePath(target, DEV_REPO) && !(await listWorktrees()).some((w) => samePath(w.path, target))) {
     throw new Error(`not a worktree of the fork: ${target}`)
   }
   const servingBranch = await gitInOrNull(target, 'rev-parse', '--abbrev-ref', 'HEAD')
@@ -739,40 +841,68 @@ async function startDevRunner(worktree) {
   return devRunnerStatus()
 }
 
-function stopDevRunner() {
+async function terminateDevRunnerTree(pid, force) {
+  if (WINDOWS) {
+    const args = ['/PID', String(pid), '/T']
+    if (force) args.push('/F')
+    await run('taskkill.exe', args, { timeout: 10_000 }).catch(() => {})
+    return
+  }
+  try {
+    process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM')
+  } catch {
+    // The process has already stopped.
+  }
+}
+
+async function stopDevRunner() {
   devRunner.stopRequested = true
   const pid = devRunner.pid
   if (!pid) {
     devRunner.state = 'stopped'
     return devRunnerStatus()
   }
-  // The exit handler does the remaining steps. Show the new state now. If you
-  // do not, the page shows "running" during the shutdown.
+  // The exit handler completes the stop. Show the new state now.
   devRunner.state = 'stopping'
-  // Send the signal to the group. The children of the runner hold the ports.
-  try { process.kill(-pid, 'SIGTERM') } catch { /* already gone */ }
-  setTimeout(() => {
-    try { process.kill(-pid, 'SIGKILL') } catch { /* already gone */ }
-  }, 3000).unref()
+  if (WINDOWS) {
+    // taskkill terminates the runner and each process below it.
+    await terminateDevRunnerTree(pid, true)
+  } else {
+    await terminateDevRunnerTree(pid, false)
+    setTimeout(() => terminateDevRunnerTree(pid, true), 3000).unref()
+  }
   return devRunnerStatus()
 }
 
-// A dashboard restart must not leave a runner without a parent. Such a runner
-// keeps its ports.
+// A dashboard restart must not leave a runner without a parent.
+let shutdownStarted = false
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => {
-    stopDevRunner()
+  process.on(signal, async () => {
+    if (shutdownStarted) return
+    shutdownStarted = true
+    if (devRunner.pid) await terminateDevRunnerTree(devRunner.pid, WINDOWS)
     process.exit(0)
   })
 }
 process.on('exit', () => {
-  if (devRunner.pid) {
-    try { process.kill(-devRunner.pid, 'SIGTERM') } catch { /* already gone */ }
+  if (!devRunner.pid) return
+  if (WINDOWS) {
+    try {
+      execFileSync('taskkill.exe', ['/PID', String(devRunner.pid), '/T', '/F'], { stdio: 'ignore' })
+    } catch {
+      // The process has already stopped.
+    }
+    return
+  }
+  try {
+    process.kill(-devRunner.pid, 'SIGTERM')
+  } catch {
+    // The process has already stopped.
   }
 })
 
-const SESSION_FILE = `${STATE_DIR}/proxy-session`
-const DEV_SESSION_FILE = `${STATE_DIR}/proxy-session-dev`
+const SESSION_FILE = join(STATE_DIR, 'proxy-session')
+const DEV_SESSION_FILE = join(STATE_DIR, 'proxy-session-dev')
 const sessionTokens = new Map()
 
 async function mintSessionToken(home) {
@@ -935,7 +1065,7 @@ function stripAnsi(value) {
 // should actually use. Minting locally also keeps `t3 pair --tailscale` from
 // repointing the Serve mapping at T3 and cutting the dashboard off.
 async function rebase(pairingUrl, base) {
-  const target = new URL('/pair', base ?? (await publishedUrl()) ?? `http://${HOST}:${PORT}`)
+  const target = new URL('/pair', base ?? (await publishedUrl()) ?? `http://${LISTEN_HOST}:${PORT}`)
   target.hash = new URL(pairingUrl).hash
   return target.toString()
 }
@@ -957,12 +1087,10 @@ async function createPairingLink({ label, ttl, home }) {
   return { pairingUrl: await rebase(pairingUrl), expires }
 }
 
-const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
-
 async function createAdministrativePairingLink() {
-  const logPath = `${STATE_DIR}/t3code.log`
+  const logPath = join(STATE_DIR, 't3code.log')
   const before = await readFile(logPath).catch(() => Buffer.alloc(0))
-  await run('systemctl', ['--user', 'restart', UNIT], { timeout: 30_000 })
+  await serviceAction('restart')
 
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
@@ -1040,22 +1168,26 @@ const BUILD_STEPS = [
   // Native, needs a Rust toolchain, and T3 runs without it. A missing cargo
   // must not cost you the whole deploy.
   step('build resource monitor (optional)', async (job) => {
+    if (WINDOWS) {
+      appendOutput(job, '[skipped] The resource monitor is for Linux.\n')
+      return
+    }
     try {
       await exec(job, PNPM_BIN, ['run', 'build:resource-monitor'])
-      const target = `${REPO}/apps/server/dist/resource-monitor/linux-x64`
+      const target = join(REPO, 'apps', 'server', 'dist', 'resource-monitor', 'linux-x64')
       await mkdir(target, { recursive: true })
       await exec(job, 'cp', [
-        `${REPO}/native/resource-monitor/target/release/t3-resource-monitor`,
-        `${target}/t3-resource-monitor`,
+        join(REPO, 'native', 'resource-monitor', 'target', 'release', 't3-resource-monitor'),
+        join(target, 't3-resource-monitor'),
       ])
-      await exec(job, 'chmod', ['+x', `${target}/t3-resource-monitor`])
+      await exec(job, 'chmod', ['+x', join(target, 't3-resource-monitor')])
     } catch (err) {
-      appendOutput(job, `\n[skipped] resource monitor: ${err.message}\n`)
+      appendOutput(job, `\n[skipped] The resource monitor failed: ${err.message}\n`)
     }
   }),
   step('verify build assets', async (job) => {
     for (const asset of BUILD_ASSETS) {
-      await readFile(`${REPO}/apps/server/${asset}`).catch(() => {
+      await readFile(join(REPO, 'apps', 'server', asset)).catch(() => {
         throw new Error(`build did not produce apps/server/${asset}`)
       })
       appendOutput(job, `ok ${asset}\n`)
@@ -1077,16 +1209,18 @@ const BUILD_STEPS = [
 const DEPLOY_STEPS = [
   step('verify a build is present', async (job) => {
     for (const asset of BUILD_ASSETS) {
-      await readFile(`${REPO}/apps/server/${asset}`).catch(() => {
+      await readFile(join(REPO, 'apps', 'server', asset)).catch(() => {
         throw new Error(`no build to deploy: apps/server/${asset} is absent. Build first.`)
       })
     }
     appendOutput(job, 'build assets present\n')
   }),
-  step('install globally', (job) => exec(job, NPM_BIN, npmInstallArgs(`${REPO}/apps/server`))),
-  step('restart service', (job) =>
-    exec(job, 'systemctl', ['--user', 'restart', UNIT], { cwd: process.env.HOME }),
-  ),
+  step('install globally', (job) => exec(job, NPM_BIN, npmInstallArgs(join(REPO, 'apps', 'server')))),
+  step('restart service', (job) => serviceAction(
+    'restart',
+    UNIT,
+    (command, args, options) => exec(job, command, args, { cwd: options.cwd }),
+  )),
   step('record deployed revision', async (job) => {
     const sha = await builtSha()
     if (!sha) throw new Error('the build revision is not recorded. Build first.')
@@ -1109,7 +1243,7 @@ const guardDeploy = step('guard deploy worktree', async (job) => {
 })
 
 const guardDev = step('guard development worktree', async (job) => {
-  if (!DEV_REPO || DEV_REPO === REPO) throw new Error('there is no separate development worktree')
+  if (!DEV_REPO || samePath(DEV_REPO, REPO)) throw new Error('there is no separate development worktree')
   if (await gitIn(DEV_REPO, 'status', '--porcelain')) {
     throw new Error(`${DEV_BRANCH} worktree has uncommitted changes`)
   }
@@ -1173,9 +1307,8 @@ const PROMOTE_STEPS = [
   step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
 ]
 
-// The dashboard updating itself. The pull is ours; the copy-and-restart is
-// refresh-dashboard.sh's, handed to systemd so it survives the restart of the
-// very process that started it. It never names the T3 Code unit.
+// The dashboard pulls its source. A detached process copies the file and
+// restarts the dashboard. The refresh does not name the T3 Code service.
 const SELF_UPDATE_STEPS = [
   step('guard dashboard repo', async (job) => {
     if (await gitHostOrNull('status', '--porcelain')) {
@@ -1187,20 +1320,40 @@ const SELF_UPDATE_STEPS = [
     exec(job, 'git', ['-C', HOST_REPO, 'pull', '--ff-only'], { cwd: HOST_REPO })),
   step('install and restart dashboard', async (job) => {
     if (!DASH_UNIT) {
-      appendOutput(job, '[skipped] no dashboard unit; this instance runs from source. Restart it to apply.\n')
+      appendOutput(job, '[skipped] No dashboard service exists. Restart this source instance to apply the update.\n')
+      return
+    }
+    if (SCHEDULED_TASK) {
+      await new Promise((resolveLaunch, rejectLaunch) => {
+        const child = spawn(POWERSHELL_BIN, [
+          '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+          '-File', join(HOST_REPO, 'refresh-dashboard.ps1'),
+        ], {
+          cwd: HOST_REPO,
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          env: { ...process.env, T3CODE_INSTANCE: INSTANCE, T3CODE_YES: '1' },
+        })
+        child.once('error', rejectLaunch)
+        child.once('spawn', () => {
+          child.unref()
+          resolveLaunch()
+        })
+      })
+      appendOutput(job, 'PowerShell owns the refresh. The dashboard restarts in a moment.\n')
       return
     }
     await exec(job, 'systemd-run', [
       '--user', '--collect',
       '--unit', `${DASH_UNIT.replace(/\.service$/, '')}-refresh`,
-      // A transient unit starts with a bare environment; the script needs the
-      // same node and git this dashboard was started with.
+      // A transient unit needs the same command path as the dashboard.
       '--setenv', `PATH=${process.env.PATH}`,
       '--setenv', `T3CODE_INSTANCE=${INSTANCE}`,
       '--setenv', 'T3CODE_YES=1',
-      `${HOST_REPO}/refresh-dashboard.sh`,
+      join(HOST_REPO, 'refresh-dashboard.sh'),
     ], { cwd: HOST_REPO })
-    appendOutput(job, 'refresh handed to systemd; the dashboard restarts in a moment\n')
+    appendOutput(job, 'systemd owns the refresh. The dashboard restarts in a moment.\n')
   }),
 ]
 
@@ -1229,7 +1382,7 @@ const JOBS = {
 // Where new feature worktrees are created: beside the repo they belong to,
 // not in the deploy or dev worktree.
 const WORKTREE_DIR = process.env.T3CODE_WORKTREE_DIR ??
-  (REPO ? `${REPO.replace(/\/[^/]+$/, '')}/worktrees` : '')
+  (REPO ? join(dirname(REPO), 'worktrees') : '')
 
 // Creating a worktree and registering it as a project in the deploy console
 // are one action: a worktree you cannot open in T3 Code is half a workflow.
@@ -1245,7 +1398,7 @@ function worktreeCreateSteps(branch, base) {
   }
   // One directory per branch, with the slashes flattened: nested directories
   // would strand the parent when a branch is both a prefix and a name.
-  const dir = `${WORKTREE_DIR}/${branch.replaceAll('/', '-')}`
+  const dir = join(WORKTREE_DIR, branch.replaceAll('/', '-'))
   return [
     step('check the branch is free', async (job) => {
       const exists = await gitOrNull('rev-parse', '--verify', `refs/heads/${branch}`)
@@ -1274,20 +1427,20 @@ function worktreeCreateSteps(branch, base) {
 // Removing pairs the two: a project pointing at a deleted worktree is worse
 // than no project at all.
 function worktreeRemoveSteps(path) {
-  if (!path || path === REPO || path === DEV_REPO) {
+  if (!path || samePath(path, REPO) || samePath(path, DEV_REPO)) {
     throw new Error('only feature worktrees can be removed')
   }
   return [
     step('verify the worktree', async (job) => {
-      const known = (await listWorktrees()).find((w) => w.path === path)
+      const known = (await listWorktrees()).find((w) => samePath(w.path, path))
       if (!known) throw new Error(`not a worktree of the fork: ${path}`)
-      if (devRunner.worktree === path) throw new Error('the dev server is serving this worktree; stop it first')
+      if (samePath(devRunner.worktree, path)) throw new Error('the dev server is serving this worktree; stop it first')
       appendOutput(job, `${known.branch} at ${path}\n`)
     }),
     step('remove the project from the deploy console', async (job) => {
       try {
         await exec(job, T3_BIN, ['project', 'remove', path, '--base-dir', T3_HOME, '--force'],
-          { cwd: process.env.HOME })
+          { cwd: USER_HOME || REPO })
       } catch (err) {
         appendOutput(job, `\n[skipped] could not remove the project: ${err.message}\n`)
       }
@@ -1382,16 +1535,16 @@ function startJob(name, params = {}) {
 }
 
 const ACTIONS = {
-  start: () => systemctl('start', UNIT),
-  stop: () => systemctl('stop', UNIT),
-  restart: () => systemctl('restart', UNIT),
+  start: () => serviceAction('start'),
+  stop: () => serviceAction('stop'),
+  restart: () => serviceAction('restart'),
   update: async () => {
     const channel = CHANNEL || channelFor(await installedVersion())
     const { stdout } = await run(NPM_BIN, npmInstallArgs(`t3@${channel}`), {
       timeout: 300_000,
       env: { ...process.env, CI: '1' },
     })
-    const after = await systemctl('restart', UNIT)
+    const after = await serviceAction('restart')
     return `${stdout.trim()}\n${after}`.trim()
   },
 }
@@ -1402,8 +1555,8 @@ const ACTIONS = {
 
 // T3CODE_MOCK=1 replaces every /_dash data source with canned states, so each
 // screen of the page can be seen and styled without a clone, a build, or a
-// systemd unit. A picker in the console header switches the scenario. The
-// proxy is untouched: the frame still shows whatever the proxy origin serves.
+// managed service. A picker in the console header switches the scenario. The
+// proxy is unchanged. The frame still shows the configured proxy origin.
 const MOCK = process.env.T3CODE_MOCK === '1'
 
 const MOCK_COMMITS = [
@@ -1511,7 +1664,7 @@ function mockRunnerStatus() {
     // The mock has no real dev console; the direct URL points at this
     // dashboard's own dev listener, whose placeholder page then shows.
     publicUrl: null,
-    directUrl: `http://${HOST}:${DEV_CONSOLE_PORT}`,
+    directUrl: `http://${LISTEN_HOST}:${DEV_CONSOLE_PORT}`,
   }
 }
 
@@ -1646,7 +1799,7 @@ function mockApi(req, res, url) {
     if (action === 'start' || action === 'restart' || action === 'update') mockState.service = 'active'
     else if (action === 'stop') mockState.service = 'inactive'
     else return json(res, 400, { error: `unknown action: ${action}` })
-    return json(res, 200, { ok: true, action, output: `(mock) systemctl --user ${action} t3code.service` })
+    return json(res, 200, { ok: true, action, output: `(mock) service ${action}: t3code` })
   }
   if (post && path === '/_dash/pair') {
     return json(res, 409, { error: 'mock mode has no real backend to pair with' })
@@ -1689,7 +1842,7 @@ const server = createServer(async (req, res) => {
     if (!url.pathname.startsWith(API_PREFIX)) return proxy(req, res, await deployTarget())
 
     // In mock mode the canned data answers every API route, so no request
-    // below this line touches git, systemd, npm, or the t3 binary.
+    // below this line touches Git, a service manager, npm, or the t3 binary.
     if (MOCK) return mockApi(req, res, url)
 
     if (req.method === 'GET' && url.pathname === '/_dash/status') {
@@ -1784,7 +1937,7 @@ const server = createServer(async (req, res) => {
       if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
 
       if (!MANAGED) {
-        return json(res, 409, { error: 'this instance is run by the dev server, not systemd' })
+        return json(res, 409, { error: 'the dev server runs this instance without a service manager' })
       }
       const action = url.searchParams.get('name')
       const fn = ACTIONS[action]
@@ -1808,8 +1961,8 @@ const server = createServer(async (req, res) => {
       if (!backend) return json(res, 503, { error: 'T3 Code is not running.' })
 
       const administrative = url.searchParams.get('administrative') === 'true'
-      // An administrative link starts the systemd unit again and reads the
-      // log of that unit. The dev runner has no unit and no log.
+      // An administrative link restarts the service and reads its log.
+      // The dev runner has no managed service and no log.
       if (administrative && backend.name !== 'deploy') {
         return json(res, 409, { error: 'administrative links apply to the deploy service only' })
       }
@@ -2550,9 +2703,8 @@ async function refresh() {
   // Serve publishes the dashboard; T3 itself is the tailnet address it binds to.
   const action = (name) => document.querySelector('[data-action="' + name + '"]')
 
-  // A control that cannot apply is absent, not greyed out. Without systemd
-  // there is nothing to control; on a running unit there is no start; on a
-  // stopped one no stop. Restart stays: on a stopped unit it is simply a start.
+  // Hide a control that does not apply. An unmanaged process has no controls.
+  // A running service has no start control. A stopped service has no stop control.
   managed = s.managed !== false
   document.querySelector('.actions.toolbar').hidden = !managed
   if (!managed) {
@@ -2866,8 +3018,8 @@ function renderFork(f) {
   const pending = f.mainBehind > 0 || f.deployBehind > 0
   const blocked = f.dirty || !f.clean || !managed
   // Each button states only its own conditions. A sync and a promote move
-  // branches, so they need clean worktrees but no systemd unit. A deploy
-  // restarts the service, so it needs the unit but no clean worktree.
+  // branches, so they need clean worktrees but no managed service. A deploy
+  // restarts the service, so it needs the service but no clean worktree.
   const busy = Boolean(f.active)
   const hasDev = Boolean(f.dev.repo && f.dev.repo !== f.repo)
   $('dev-empty').hidden = hasDev
@@ -3518,12 +3670,12 @@ devConsole.on('error', (err) => {
   console.error(`dev console listener failed: ${err.message}`)
 })
 
-server.listen(PORT, HOST, () => {
-  console.log(`t3code dashboard on http://${HOST}:${PORT}/`)
+server.listen(PORT, LISTEN_HOST, () => {
+  console.log(`t3code dashboard on http://${LISTEN_HOST}:${PORT}/`)
   if (REPO) console.log(`source mode: ${REPO} (${BRANCH})`)
 })
 if (DEV_REPO) {
-  devConsole.listen(DEV_CONSOLE_PORT, HOST, () => {
-    console.log(`dev console on http://${HOST}:${DEV_CONSOLE_PORT}/`)
+  devConsole.listen(DEV_CONSOLE_PORT, LISTEN_HOST, () => {
+    console.log(`dev console on http://${LISTEN_HOST}:${DEV_CONSOLE_PORT}/`)
   })
 }

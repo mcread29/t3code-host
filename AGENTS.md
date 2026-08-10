@@ -92,9 +92,14 @@ env -i HOME=$HOME PATH="<the PATH of the unit>" npm uninstall -g no-such-package
 The exit code must be 0.
 
 The buttons in the dashboard follow the same rule. The jobs are `pull-deploy`,
-`pull-dev`, `main`, `merge-main-dev`, `promote`, `build`, `deploy`, and
-`self-update`. Each job moves one thing. Do not make a job that chains them,
-and do not add a merge to a job that builds.
+`pull-dev`, `main`, `merge-main-dev`, `promote`, `build`, `deploy`,
+`self-update`, `commit`, and `push`. Each job moves one thing. Do not make a
+job that chains them, and do not add a merge to a job that builds. A commit
+does not push, and a push does not merge.
+
+A commit and a push act on the development worktree, or on a feature worktree.
+They never act on the deploy worktree: that worktree holds the release, and
+each job that builds requires it clean.
 
 ## Keep the release machines out of the integration
 

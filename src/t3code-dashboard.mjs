@@ -410,7 +410,7 @@ async function deployedSha() {
 // release machine does not track `main`, does not track `dev`, and thus pays
 // for none of these commands.
 async function integrationStatus() {
-  const [mainBehind, mainBehindOrigin, devBehindMain, devHead, devDirty, devAhead, devBehindOrigin] = await Promise.all([
+  const [mainBehind, mainBehindOrigin, devBehindMain, devHead, devDirty, devAhead, devBehindOrigin, devRemote] = await Promise.all([
     gitOrNull('rev-list', '--count', 'main..upstream/main'),
     gitOrNull('rev-list', '--count', 'main..origin/main'),
     gitOrNull('rev-list', '--count', `${DEV_BRANCH}..main`),
@@ -418,6 +418,7 @@ async function integrationStatus() {
     DEV_REPO ? gitIn(DEV_REPO, 'status', '--porcelain').catch(() => null) : null,
     gitOrNull('rev-list', '--count', `${BRANCH}..${DEV_BRANCH}`),
     gitOrNull('rev-list', '--count', `${DEV_BRANCH}..origin/${DEV_BRANCH}`),
+    unpushed(DEV_BRANCH),
   ])
 
   // Preview both merges. The second one is checked against upstream/main
@@ -449,6 +450,7 @@ async function integrationStatus() {
       behindOrigin: Number(devBehindOrigin ?? 0),
       clean: devPreview.clean,
       conflicts: devPreview.conflicts,
+      ...devRemote,
     },
     clean: syncPreview.clean && mainDevPreview.clean,
     conflicts: [...new Set([...syncPreview.conflicts, ...mainDevPreview.conflicts, ...devPreview.conflicts])],
@@ -465,6 +467,7 @@ const NO_INTEGRATION = {
   dev: {
     repo: null, branch: DEV_BRANCH, head: null,
     dirty: false, ahead: 0, behindOrigin: 0, clean: true, conflicts: [],
+    tracked: true, aheadOrigin: 0,
   },
   clean: true,
   conflicts: [],
@@ -600,11 +603,12 @@ async function listWorktrees() {
 async function worktreeStatus() {
   const worktrees = await listWorktrees()
   return Promise.all(worktrees.map(async (w) => {
-    const [head, dirty, ahead, inDev] = await Promise.all([
+    const [head, dirty, ahead, inDev, remote] = await Promise.all([
       gitOrNull('rev-parse', '--short', w.branch),
       gitInOrNull(w.path, 'status', '--porcelain'),
       gitOrNull('rev-list', '--count', `${BRANCH}..${w.branch}`),
       gitOrNull('merge-base', '--is-ancestor', w.branch, DEV_BRANCH).then((r) => r !== null),
+      unpushed(w.branch),
     ])
     const isDev = w.branch === DEV_BRANCH
     const preview = !isDev && !inDev
@@ -616,8 +620,26 @@ async function worktreeStatus() {
       aheadDeploy: Number(ahead ?? 0),
       inDev: Boolean(inDev),
       clean: preview.clean, conflicts: preview.conflicts,
+      ...remote,
     }
   }))
+}
+
+// What a push would send. A branch with no branch on the remote has each of
+// its commits to send, and the push must make the remote branch. Thus the two
+// facts travel together.
+async function unpushed(branch) {
+  const tracked = await gitOrNull('rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`)
+  if (tracked === null) {
+    // A branch that the fork does not have still shares the commits of the
+    // branch it was cut from. Count only what no branch of the fork holds.
+    // The whole history would say "12 to push" for a worktree made a moment
+    // ago, and each of those commits is already on the fork.
+    const count = await gitOrNull('rev-list', '--count', branch, '--not', '--remotes=origin')
+    return { tracked: false, aheadOrigin: Number(count ?? 0) }
+  }
+  const count = await gitOrNull('rev-list', '--count', `origin/${branch}..${branch}`)
+  return { tracked: true, aheadOrigin: Number(count ?? 0) }
 }
 
 async function incomingCommits() {
@@ -1633,12 +1655,82 @@ function branchJobSteps(name, branch) {
   throw new Error(`unknown job: ${name}`)
 }
 
+// A commit and a push act on a worktree that you work in. The deploy worktree
+// is not one of them: it holds the release, each job that builds requires it
+// clean, and a commit there is a mistake that a button must not make.
+// The one test that needs no git. It runs when the job starts, so the deploy
+// worktree is refused before a job exists to fail.
+function guardWritablePath(path) {
+  if (!path || samePath(path, REPO)) {
+    throw new Error('only the development worktree and a feature worktree can be committed')
+  }
+}
+
+async function writableWorktree(path) {
+  guardWritablePath(path)
+  const known = samePath(path, DEV_REPO) || (await listWorktrees()).some((w) => samePath(w.path, path))
+  if (!known) throw new Error(`not a worktree of the fork: ${path}`)
+  const branch = await gitInOrNull(path, 'rev-parse', '--abbrev-ref', 'HEAD')
+  if (!branch || branch === 'HEAD') throw new Error(`${path} has no branch checked out`)
+  if (branch === BRANCH) throw new Error(`${BRANCH} is the release branch; it takes no commit`)
+  return branch
+}
+
+// One commit of everything in the worktree. The message is yours. The job
+// pushes nothing: a commit and a push are two steps, so you can read the
+// commit before it leaves the machine.
+function commitSteps(path, message) {
+  guardWritablePath(path)
+  const text = (message ?? '').trim()
+  if (!text) throw new Error('a commit needs a message')
+  if (text.length > 500) throw new Error('the commit message is too long')
+  return [
+    step('verify the worktree', async (job) => {
+      const branch = await writableWorktree(path)
+      if (!(await gitInOrNull(path, 'status', '--porcelain'))) {
+        throw new Error('there is nothing to commit')
+      }
+      appendOutput(job, `${branch} at ${path}\n`)
+    }),
+    step('stage each change', (job) =>
+      exec(job, 'git', ['-C', path, 'add', '--all'], { cwd: path })),
+    step('commit', (job) =>
+      exec(job, 'git', ['-C', path, 'commit', '-m', text], { cwd: path })),
+  ]
+}
+
+// A push sends the branch of one worktree to the fork. It merges nothing.
+function pushSteps(path) {
+  guardWritablePath(path)
+  return [
+    step('verify the worktree', async (job) => {
+      const branch = await writableWorktree(path)
+      if (await gitInOrNull(path, 'status', '--porcelain')) {
+        appendOutput(job, 'note: the worktree has uncommitted changes. A push sends commits only.\n')
+      }
+      appendOutput(job, `${branch} at ${path}\n`)
+    }),
+    step('push', async (job) => {
+      const branch = await writableWorktree(path)
+      const tracked = await gitOrNull('rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`)
+      // A branch that the fork does not have needs the upstream as well. Thus
+      // the next push of that branch needs no argument.
+      const args = tracked === null
+        ? ['-C', path, 'push', '-u', 'origin', branch]
+        : ['-C', path, 'push', 'origin', branch]
+      await exec(job, 'git', args, { cwd: path })
+    }),
+  ]
+}
+
 function parameterizedSteps(name, params) {
   if (name === 'merge-into-dev' || name === 'promote-branch') {
     return branchJobSteps(name, params.branch)
   }
   if (name === 'worktree-create') return worktreeCreateSteps(params.branch, params.base)
   if (name === 'worktree-remove') return worktreeRemoveSteps(params.path)
+  if (name === 'commit') return commitSteps(params.path, params.message)
+  if (name === 'push') return pushSteps(params.path)
   return null
 }
 
@@ -1647,6 +1739,7 @@ function parameterizedSteps(name, params) {
 const DEV_MODE_JOBS = new Set([
   'pull-dev', 'main', 'merge-main-dev', 'promote',
   'merge-into-dev', 'promote-branch', 'worktree-create', 'worktree-remove',
+  'commit', 'push',
 ])
 
 function startJob(name, params = {}) {
@@ -1747,6 +1840,10 @@ const MOCK_SCENARIOS = {
     },
   },
   dirty: { fork: { dirty: true, dev: { dirty: true } } },
+  // Work that is not committed, and commits that are not pushed. The dev
+  // section then shows each control that a worktree of your own needs.
+  'dev-uncommitted': { fork: { dev: { dirty: true, aheadOrigin: 2 } } },
+  'dev-unpushed': { fork: { dev: { aheadOrigin: 3 } } },
   'job-fails': { fork: { tip: 'ef45ab1', needsRebuild: true }, jobOutcome: 'failed' },
   'service-stopped': { status: { active: 'inactive', sub: 'dead', pid: null, startedAt: null, origin: null } },
   'service-failed': { status: { active: 'failed', sub: 'failed', pid: null, startedAt: null, origin: null, restarts: '4' } },
@@ -1755,11 +1852,14 @@ const MOCK_SCENARIOS = {
     fork: {
       worktrees: [
         { path: '/mock/wt/no-autoscroll', branch: 'fix/no-autoscroll', head: 'ab34cd5', isDev: false,
-          dirty: false, aheadDeploy: 2, inDev: false, clean: true, conflicts: [] },
+          dirty: false, aheadDeploy: 2, inDev: false, clean: true, conflicts: [],
+          tracked: true, aheadOrigin: 0 },
         { path: '/mock/wt/notifications', branch: 'feat/notifications', head: 'ef56ab7', isDev: false,
-          dirty: true, aheadDeploy: 5, inDev: true, clean: true, conflicts: [] },
+          dirty: true, aheadDeploy: 5, inDev: true, clean: true, conflicts: [],
+          tracked: false, aheadOrigin: 5 },
         { path: '/mock/wt/branding', branch: 'fork/branding', head: '9a8b7c6', isDev: false,
-          dirty: false, aheadDeploy: 1, inDev: false, clean: false, conflicts: ['apps/web/src/theme.ts'] },
+          dirty: false, aheadDeploy: 1, inDev: false, clean: false, conflicts: ['apps/web/src/theme.ts'],
+          tracked: true, aheadOrigin: 1 },
       ],
     },
   },
@@ -1794,6 +1894,7 @@ function mockFork() {
     dev: {
       repo: '/mock/t3code/dev', branch: 'dev', head: 'ab12cd3',
       dirty: false, ahead: 0, behindOrigin: 0, clean: true, conflicts: [],
+      tracked: true, aheadOrigin: 0,
       ...dev,
     },
     active: mockState.job?.state === 'running' ? mockState.job.id : null,
@@ -1854,7 +1955,11 @@ function startMockJob(name, branch) {
         ? ['check the branch is free', 'fetch', 'create the worktree', 'add it as a project']
         : name === 'worktree-remove'
           ? ['verify the worktree', 'remove the project', 'remove the worktree']
-          : [])
+          : name === 'commit'
+            ? ['verify the worktree', 'stage each change', 'commit']
+            : name === 'push'
+              ? ['verify the worktree', 'push']
+              : [])
   if (!labels.length) throw new Error(`unknown job: ${name}`)
   const outcome = mockScenario().jobOutcome ?? 'ok'
 
@@ -2121,6 +2226,7 @@ const server = createServer(async (req, res) => {
           branch: url.searchParams.get('branch') ?? undefined,
           base: url.searchParams.get('base') ?? undefined,
           path: url.searchParams.get('path') ?? undefined,
+          message: url.searchParams.get('message') ?? undefined,
         })
         return json(res, 200, { id: job.id, name: job.name })
       } catch (err) {
@@ -2406,8 +2512,10 @@ const PAGE = String.raw`<!doctype html>
   /* A worktree row: the branch is the serve action, and the two icons move
      the branch into dev or deploy. The row itself is a plain container. */
   div.step { cursor:default; }
+  /* The branch name gives up width before a control does, so a long name
+     never pushes the icons of its own row out of the sidebar. */
   .wt-name {
-    flex:none; min-width:0; padding:0; border:0; background:none;
+    flex:0 1 auto; min-width:0; padding:0; border:0; background:none;
     font:inherit; font-size:.78rem; color:var(--text); cursor:pointer;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
@@ -2415,6 +2523,10 @@ const PAGE = String.raw`<!doctype html>
   .wt-name:disabled { color:var(--faint); cursor:default; }
   div.step .meta { margin-left:auto; }
   div.step button.icon { width:22px; height:22px; font-size:.72rem; margin:-2px 0; }
+  /* A worktree row carries the most parts of any row in the sidebar. A tighter
+     gap between them buys the branch name and the meta about 20 pixels, which
+     is the difference between a readable row and two truncated ones. */
+  .step.wt { gap:.3rem; }
   div.step.serving .glyph::before { content:'●'; color:var(--green); }
   .step .glyph { flex:none; width:1rem; text-align:center; color:var(--faint); }
   .step .glyph::before { content:'○'; }
@@ -2422,7 +2534,16 @@ const PAGE = String.raw`<!doctype html>
   .step.current { color:var(--text); background:rgba(125,211,252,.04); }
   .step.current .glyph::before { content:'●'; color:var(--accent); }
   .step .lbl { flex:none; }
-  .step .meta { margin-left:auto; color:var(--faint); font-size:.7rem; text-align:right; }
+  /* A worktree row can carry four controls and a long branch name. Each
+     control must stay reachable, so something gives up width. The meta goes
+     first (shrink 100 against the name's 1), because the icons already carry
+     the state that it names, and the title has the whole text. The branch
+     name is the identity of the row, so it shrinks last. */
+  .step .meta {
+    margin-left:auto; color:var(--faint); font-size:.7rem; text-align:right;
+    flex:0 100 auto; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
   .step.current .meta { color:var(--accent); }
   .step .meta.warn { color:var(--amber); }
   /* The running job spins in the glyph column; the generic trailing spinner
@@ -2555,12 +2676,17 @@ const PAGE = String.raw`<!doctype html>
   .confirm-actions { display:flex; gap:.5rem; justify-content:flex-end; padding:.8rem .95rem .9rem; }
   .confirm-actions button { flex:0 0 auto; min-width:96px; }
 
-  dialog#new-wt, dialog#settings {
+  dialog#new-wt, dialog#settings, dialog#commit-dlg {
     width:min(420px, 90vw); padding:0; color:var(--text);
     background:var(--panel); border:1px solid var(--line); border-radius:12px;
     box-shadow:0 24px 60px -20px #000;
   }
-  dialog#new-wt::backdrop, dialog#settings::backdrop { background:rgba(0,0,0,.6); }
+  dialog#new-wt::backdrop, dialog#settings::backdrop,
+  dialog#commit-dlg::backdrop { background:rgba(0,0,0,.6); }
+  /* The commit control writes; the push control sends. Neither is destructive,
+     so they take the accent rather than the red of Remove. */
+  .step button.icon.wt-commit:hover:not(:disabled),
+  .step button.icon.wt-push:hover:not(:disabled) { color:var(--accent); border-color:#2b4a5a; }
 
   /* One setting is one row: the name and its switch on one line, and the
      reason for it below. Thus you read what the setting changes before you
@@ -2744,7 +2870,19 @@ const PAGE = String.raw`<!doctype html>
         <div class="dev-empty" id="dev-empty" hidden>No development worktree is configured.
           Run <code>T3CODE_DEV_MODE=1 ./install.sh</code> on this machine to make one.</div>
         <div id="dev-content">
+          <!-- The development worktree, and the two controls that a worktree
+               of your own needs: commit what you changed, and push what you
+               committed. Each one shows only while it has something to do. -->
           <div class="dev-line" id="dev-line">—</div>
+          <div class="steps" id="dev-work" hidden aria-label="Development worktree">
+            <div class="step">
+              <span class="glyph"></span>
+              <span class="lbl" id="dev-work-branch">dev</span>
+              <span class="meta" id="dev-work-meta"></span>
+              <button class="icon wt-commit" id="dev-commit" title="Commit each change in this worktree">✎</button>
+              <button class="icon wt-push" id="dev-push" title="Push this branch to the fork">⇧</button>
+            </div>
+          </div>
           <!-- One row per feature worktree: click the branch to serve it on
                the dev tab; the icons merge it into dev or promote it into
                deploy. Dev itself stays the staging pipeline below. -->
@@ -2812,6 +2950,23 @@ const PAGE = String.raw`<!doctype html>
       <div class="confirm-actions">
         <button value="cancel" formnovalidate>Cancel</button>
         <button value="create" class="primary">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- One commit of everything in one worktree. The job stages each change,
+       and it pushes nothing: you read the commit before it leaves. -->
+  <dialog id="commit-dlg">
+    <div class="modal-head"><span>commit</span><span class="job" id="commit-branch"></span></div>
+    <form method="dialog" id="commit-form">
+      <label class="field">message
+        <input id="commit-message" name="message" placeholder="fix: keep the sidebar scroll position"
+          required autocomplete="off" maxlength="500">
+      </label>
+      <p class="confirm-body" id="commit-hint"></p>
+      <div class="confirm-actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="commit" class="primary">Commit</button>
       </div>
     </form>
   </dialog>
@@ -3338,6 +3493,7 @@ function renderFork(f) {
   // The path answers "where do I go to work on this"; the ahead/behind counts
   // already live in the two step metas below.
   $('dev-line').innerHTML = esc(f.dev.repo || '—') + (f.dev.dirty ? flag('dirty') : '')
+  renderDevWork(f.dev, busy)
   lastWorktrees = f.worktrees ?? []
   forkBusy = busy
   renderWorktrees()
@@ -3680,6 +3836,33 @@ for (const [id, name, title, message] of JOB_UI) {
 let lastWorktrees = []
 let forkBusy = false
 let servingWorktree = null
+let devWorktreePath = null
+
+// What a worktree of your own asks for: the changes to commit, then the
+// commits to send. The row disappears when it asks for neither.
+function workMeta(w) {
+  return [
+    w.dirty ? 'uncommitted' : null,
+    (w.aheadOrigin ?? 0) > 0 ? w.aheadOrigin + ' to push' : null,
+    w.tracked === false ? 'not on the fork' : null,
+  ].filter(Boolean).join(' · ')
+}
+
+function renderDevWork(dev, busy) {
+  devWorktreePath = dev.repo ?? null
+  const wanted = Boolean(dev.repo) && (dev.dirty || (dev.aheadOrigin ?? 0) > 0)
+  $('dev-work').hidden = !wanted
+  if (!wanted) return
+  $('dev-work-branch').textContent = dev.branch
+  const meta = $('dev-work-meta')
+  meta.textContent = workMeta(dev)
+  meta.title = meta.textContent
+  meta.classList.toggle('warn', dev.dirty)
+  $('dev-commit').hidden = !dev.dirty
+  $('dev-commit').disabled = busy
+  $('dev-push').hidden = (dev.aheadOrigin ?? 0) === 0
+  $('dev-push').disabled = busy
+}
 
 function renderWorktrees() {
   const rows = lastWorktrees.filter((w) => !w.isDev)
@@ -3687,25 +3870,47 @@ function renderWorktrees() {
   list.hidden = !rows.length
   list.innerHTML = rows.map((w) => {
     const serving = servingWorktree === w.path
+    // The commit and push controls appear only while they apply, so the row
+    // says each fact once: the icon carries "you can commit" and "you can
+    // push", and the count of a push is in the title of its control.
+    //
+    // A busy row has five controls, and the meta then gives up its width. Thus
+    // the fact that stops you comes first, and the count comes last.
     const meta = [
-      w.aheadDeploy + ' ahead',
-      w.inDev ? 'in dev' : null,
-      w.dirty ? 'dirty' : null,
       !w.clean ? 'conflicts' : null,
+      w.dirty ? 'dirty' : null,
+      w.inDev ? 'in dev' : null,
+      w.aheadDeploy + ' ahead',
     ].filter(Boolean).join(' · ')
     const warn = w.dirty || !w.clean
     return '<div class="step wt' + (serving ? ' serving' : '') + '">' +
       '<span class="glyph"></span>' +
       '<button class="wt-name" data-path="' + esc(w.path) + '" data-branch="' + esc(w.branch) + '"' +
       ' title="Serve ' + esc(w.branch) + ' on the dev tab">' + esc(w.branch) + '</button>' +
-      '<span class="meta' + (warn ? ' warn' : '') + '">' + esc(meta) + '</span>' +
+      '<span class="meta' + (warn ? ' warn' : '') + '" title="' + esc(meta) + '">' + esc(meta) + '</span>' +
+      // The two controls of the worktree itself come first: you commit and
+      // push before a merge has anything to take.
+      (w.dirty
+        ? '<button class="icon wt-commit" data-path="' + esc(w.path) + '" data-branch="' + esc(w.branch) +
+          '" title="Commit each change in this worktree"' + (forkBusy ? ' disabled' : '') + '>✎</button>'
+        : '') +
+      ((w.aheadOrigin ?? 0) > 0
+        ? '<button class="icon wt-push" data-path="' + esc(w.path) + '" data-branch="' + esc(w.branch) +
+          '" title="Push ' + w.aheadOrigin + ' commit(s) of ' + esc(w.branch) +
+          (w.tracked === false ? ' to the fork, which does not have this branch yet"' : ' to the fork"') +
+          (forkBusy ? ' disabled' : '') + '>⇧</button>'
+        : '') +
       '<button class="icon wt-merge" data-branch="' + esc(w.branch) + '" title="Merge into dev"' +
       (forkBusy || w.inDev || !w.clean ? ' disabled' : '') + '>⇣</button>' +
       '<button class="icon wt-promote" data-branch="' + esc(w.branch) + '" title="Promote into deploy"' +
       (forkBusy || w.aheadDeploy === 0 ? ' disabled' : '') + '>⇡</button>' +
-      '<button class="icon danger wt-remove" data-path="' + esc(w.path) + '" data-branch="' +
-      esc(w.branch) + '" title="Remove the worktree and its project"' +
-      (forkBusy || serving ? ' disabled' : '') + '>✕</button>' +
+      // Git refuses to remove a worktree that has uncommitted changes. Thus
+      // the control goes away until you commit them, and the row keeps the
+      // width for the controls that do work.
+      (w.dirty ? ''
+        : '<button class="icon danger wt-remove" data-path="' + esc(w.path) + '" data-branch="' +
+          esc(w.branch) + '" title="Remove the worktree and its project"' +
+          (forkBusy || serving ? ' disabled' : '') + '>✕</button>') +
       '</div>'
   }).join('')
 }
@@ -3726,10 +3931,47 @@ async function serveWorktree(path, branch) {
   settleRunner()
 }
 
+// The commit dialog takes the message, and nothing else: the job stages every
+// change in that worktree. Thus the dialog asks one question.
+const commitDialog = $('commit-dlg')
+let commitPath = null
+
+function askCommit(path, branch) {
+  commitPath = path
+  $('commit-branch').textContent = branch
+  $('commit-message').value = ''
+  $('commit-hint').textContent =
+    'Commits each change in ' + path + '. This pushes nothing, and it merges nothing.'
+  commitDialog.showModal()
+  $('commit-message').focus()
+}
+
+commitDialog.onclick = (e) => { if (e.target === commitDialog) commitDialog.close() }
+$('commit-form').onsubmit = () => {
+  if (commitDialog.returnValue === 'cancel') return
+  const message = $('commit-message').value.trim()
+  if (!message || !commitPath) return
+  startJobWith('commit', { path: commitPath, message })
+}
+
+async function pushWorktree(path, branch) {
+  if (await confirmAction('push ' + branch,
+    'Push ' + branch + ' to the fork. This builds nothing, and it merges nothing.')) {
+    startJobWith('push', { path })
+  }
+}
+
+$('dev-commit').onclick = () => askCommit(devWorktreePath, $('dev-work-branch').textContent)
+$('dev-push').onclick = () => pushWorktree(devWorktreePath, $('dev-work-branch').textContent)
+
 $('wt-list').onclick = async (e) => {
   const serve = e.target.closest('.wt-name')
   const merge = e.target.closest('.wt-merge')
   const promote = e.target.closest('.wt-promote')
+  const commit = e.target.closest('.wt-commit')
+  const push = e.target.closest('.wt-push')
+  if (commit && !commit.disabled) return askCommit(commit.dataset.path, commit.dataset.branch)
+  if (push && !push.disabled) return pushWorktree(push.dataset.path, push.dataset.branch)
   if (serve && !serve.disabled) return serveWorktree(serve.dataset.path, serve.dataset.branch)
   if (merge && !merge.disabled) {
     const branch = merge.dataset.branch

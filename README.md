@@ -233,11 +233,19 @@ Each button moves one thing. The arrow gives the direction.
 RELEASE  Pull deploy       pulls the shared deploy branch. It does not push.
 RELEASE  Build             compiles the source. No install. No restart.
 RELEASE  Deploy            installs the build and restarts T3 Code. No compile.
+DEV      commit  (pencil)  commits each change in one worktree. It does not push.
+DEV      push    (arrow)   pushes the branch of one worktree. It merges nothing.
 DEV      dev <- origin     pulls the shared dev branch. It does not push.
 DEV      main <- upstream  moves main only. It pushes main.
 DEV      dev <- main       merges main into dev. It pushes dev.
 DEV      deploy <- dev     promotes dev to deploy. It pushes deploy.
 ```
+
+The commit and push controls belong to a worktree that you work in. They are on
+the row of the development worktree, and on the row of each feature worktree.
+Each control shows only while it applies: the pencil while the worktree has
+changes, and the arrow while the branch has commits that the fork does not
+have. The deploy worktree takes no commit, because it holds the release.
 
 No button builds and merges together. No button merges two pairs of branches
 together.

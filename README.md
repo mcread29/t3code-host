@@ -213,9 +213,9 @@ T3CODE_INSTANCE=production ./update.sh
 Each button moves one thing. The arrow gives the direction.
 
 ```text
+FORK   deploy <- origin    pulls the shared deploy branch. It does not push.
 FORK   main <- upstream    moves main only. It pushes main.
-FORK   deploy <- main      merges main into deploy. It pushes deploy.
-DEV    dev <- deploy       merges deploy into dev. It pushes dev.
+DEV    dev <- main         merges main into dev. It pushes dev.
 DEV    deploy <- dev       promotes dev to deploy. It pushes deploy.
 BUILD  Build               compiles the source. No install. No restart.
 BUILD  Deploy              installs the build and restarts T3 Code. No compile.
@@ -224,14 +224,14 @@ BUILD  Deploy              installs the build and restarts T3 Code. No compile.
 No button builds and merges together. No button merges two pairs of branches
 together.
 
-A full upgrade is these steps, in this sequence:
+A machine updates its release with these steps:
 
 ```text
-main <- upstream   ->   deploy <- main   ->   dev <- deploy   ->   Build   ->   Deploy
+deploy <- origin/deploy   ->   Build   ->   Deploy
 ```
 
-Thus a conflict in one step leaves the other branches where they were. You
-repeat one step, and not the full sequence. Only **Deploy** stops your sessions.
+One integration machine updates `main` and `dev`. It promotes `dev` to
+`deploy`. Other machines pull `deploy`. Only **Deploy** stops your sessions.
 
 `update.sh` gets both remotes. It moves `main` forward to `upstream/main`. It
 looks for conflicts. It merges `main` into `deploy`. It builds the source. It
@@ -334,18 +334,20 @@ new session when you change the tab.
 There are three branches. `main` is a copy of upstream. The production service
 builds `deploy`. You do your work on `dev`.
 
-**Sync, build & deploy** moves the changes in this direction:
+The release controls move changes in this direction:
 
 ```text
-upstream  ->  main  ->  deploy  ->  dev
+origin/deploy  ->  deploy  ->  build  ->  restart
 ```
+
+Use **Pull deploy** on each release machine. The pull permits a fast-forward
+only. Thus the pull does not overwrite local commits.
+
+Use the integration controls on the integration machine. These controls move
+changes from `upstream` to `main`, then `dev`, and then `deploy`.
 
 Each merge does a fast-forward when the history permits one. It makes a merge
 commit only when the history does not permit a fast-forward.
-
-The step that merges `deploy` into `dev` is not fatal. A conflict in this step
-keeps the correct deployed build. You then correct the `dev` branch by hand. If
-the `dev` worktree has uncommitted changes, the step does not run.
 
 **Promote to deploy** moves the changes in the opposite direction:
 
@@ -424,9 +426,9 @@ development worktree at `~/.local/share/t3code-host/dev`.
 The project uses three branches:
 
 ```text
-upstream/main  --sync-->  main  --merge-->  deploy  --build-->  the service
+origin/deploy  --pull-->  deploy  --build-->  the service
 
-                          dev  --merge-->  deploy
+upstream/main  --sync-->  main  --merge-->  dev  --promote-->  deploy
 ```
 
 `main` is a copy of the upstream branch. The deployment worktree always has
@@ -445,25 +447,12 @@ Set these variables when you install:
 | `T3CODE_BRANCH` | `deploy` |
 | `T3CODE_DEV_BRANCH` | `dev` |
 
-The fork card in the dashboard shows the distance of each branch. It tests both
-merges with `git merge-tree`. Thus it shows conflicts before it changes files.
+The fork card shows the distance from `origin/deploy`. **Pull deploy** requires
+a clean worktree and a fast-forward. **Build** compiles the source. **Deploy**
+installs the build and restarts T3 Code.
 
-**Sync, build & deploy** is on only if both merges are clean. The worktree must
-also be clean. The button does these steps:
-
-1. It gets `origin` and `upstream`.
-2. It moves `main` forward to `upstream/main`. It pushes `main`.
-3. It merges `main` into `deploy` with `--no-ff`.
-4. It runs `pnpm install`. It builds the web client. It builds the CLI. It
-   builds the resource monitor if `cargo` is available.
-5. It runs `npm install -g <repo>/apps/server`.
-6. It starts `t3code.service` again. It then pushes `deploy`.
-
-The build does not touch the service until the build is complete. If a merge
-has a conflict, the dashboard stops the merge. It does not correct the conflict.
-
-**Rebuild & deploy** does steps 4 to 6 only. **Merge dev, build & deploy**
-merges the commits in `dev` into `deploy`. Both worktrees must be clean.
+The dev card contains the integration controls. It also shows merge conflicts
+before a merge changes a worktree.
 
 A build takes some minutes. Thus a build is a background job. The page reads the
 output. The output stays after you load the page again. Only one job runs at a

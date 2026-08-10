@@ -357,28 +357,29 @@ async function deployedSha() {
 async function forkStatus() {
   if (!REPO) return null
 
-  const [branch, head, dirty, mainBehind, deployBehind, built, deployed, devHead, devDirty, devAhead, devBehind] = await Promise.all([
+  const [branch, head, dirty, remoteDeployBehind, remoteDeployAhead, mainBehind, devBehindMain, built, deployed, devHead, devDirty, devAhead] = await Promise.all([
     gitOrNull('rev-parse', '--abbrev-ref', 'HEAD'),
     gitOrNull('rev-parse', '--short', 'HEAD'),
     gitOrNull('status', '--porcelain'),
+    gitOrNull('rev-list', '--count', `${BRANCH}..origin/${BRANCH}`),
+    gitOrNull('rev-list', '--count', `origin/${BRANCH}..${BRANCH}`),
     gitOrNull('rev-list', '--count', 'main..upstream/main'),
-    gitOrNull('rev-list', '--count', `${BRANCH}..main`),
+    gitOrNull('rev-list', '--count', `${DEV_BRANCH}..main`),
     builtSha(),
     deployedSha(),
     DEV_REPO ? gitIn(DEV_REPO, 'rev-parse', '--short', 'HEAD').catch(() => null) : null,
     DEV_REPO ? gitIn(DEV_REPO, 'status', '--porcelain').catch(() => null) : null,
     gitOrNull('rev-list', '--count', `${BRANCH}..${DEV_BRANCH}`),
-    gitOrNull('rev-list', '--count', `${DEV_BRANCH}..${BRANCH}`),
   ])
 
   // Preview both merges. The second one is checked against upstream/main
   // rather than main whenever a sync is pending: main is about to become
   // upstream/main, and merging today's main would miss the real conflict.
   const pendingSync = Number(mainBehind) > 0
-  const [syncPreview, deployPreview, devPreview] = await Promise.all([
+  const [syncPreview, mainDevPreview, devPreview] = await Promise.all([
     pendingSync ? mergePreview('main', 'upstream/main') : { clean: true, conflicts: [] },
-    pendingSync || Number(deployBehind) > 0
-      ? mergePreview(BRANCH, pendingSync ? 'upstream/main' : 'main')
+    pendingSync || Number(devBehindMain) > 0
+      ? mergePreview(DEV_BRANCH, pendingSync ? 'upstream/main' : 'main')
       : { clean: true, conflicts: [] },
     Number(devAhead) > 0
       ? mergePreview(BRANCH, DEV_BRANCH)
@@ -396,7 +397,7 @@ async function forkStatus() {
     gitOrNull('rev-parse', '--short', BRANCH),
     worktreeStatus(),
   ])
-  const conflicts = [...new Set([...syncPreview.conflicts, ...deployPreview.conflicts, ...devPreview.conflicts])]
+  const conflicts = [...new Set([...syncPreview.conflicts, ...mainDevPreview.conflicts, ...devPreview.conflicts])]
 
   return {
     repo: REPO,
@@ -410,19 +411,20 @@ async function forkStatus() {
     needsRebuild: Boolean(tip && (tip !== built || !hasBuild)),
     needsDeploy: Boolean(hasBuild && built && built !== deployed),
     dirty: Boolean(dirty),
+    remoteDeployBehind: Number(remoteDeployBehind ?? 0),
+    remoteDeployAhead: Number(remoteDeployAhead ?? 0),
     mainBehind: Number(mainBehind ?? 0),
-    deployBehind: Number(deployBehind ?? 0),
+    devBehindMain: Number(devBehindMain ?? 0),
     dev: {
       repo: DEV_REPO,
       branch: DEV_BRANCH,
       head: devHead,
       dirty: Boolean(devDirty),
       ahead: Number(devAhead ?? 0),
-      behind: Number(devBehind ?? 0),
       clean: devPreview.clean,
       conflicts: devPreview.conflicts,
     },
-    clean: syncPreview.clean && deployPreview.clean,
+    clean: syncPreview.clean && mainDevPreview.clean,
     conflicts,
     worktrees,
   }
@@ -1230,9 +1232,7 @@ const DEPLOY_STEPS = [
   }),
 ]
 
-// One merge for each pair of branches, and nothing else in the job. Thus a
-// conflict between main and deploy leaves dev where it was, and you repeat one
-// step and not three.
+// One job merges one pair of branches. Thus a conflict changes no other pair.
 const guardDeploy = step('guard deploy worktree', async (job) => {
   if (await git('status', '--porcelain')) {
     throw new Error(`${BRANCH} worktree has uncommitted changes`)
@@ -1264,15 +1264,18 @@ const MAIN_STEPS = [
   }),
 ]
 
-const MERGE_DEPLOY_STEPS = [
+const PULL_DEPLOY_STEPS = [
   guardDeploy,
-  step(`merge main into ${BRANCH}`, (job) => mergeInto(job, REPO, 'main', BRANCH)),
-  step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
+  step('fetch deploy', (job) =>
+    exec(job, 'git', ['-C', REPO, 'fetch', '--prune', 'origin', BRANCH])),
+  step(`move ${BRANCH} to origin/${BRANCH}`, async (job) => {
+    await exec(job, 'git', ['-C', REPO, 'merge', '--ff-only', `origin/${BRANCH}`])
+  }),
 ]
 
-const MERGE_DEV_STEPS = [
+const MERGE_MAIN_DEV_STEPS = [
   guardDev,
-  step(`merge ${BRANCH} into ${DEV_BRANCH}`, (job) => mergeInto(job, DEV_REPO, BRANCH, DEV_BRANCH)),
+  step(`merge main into ${DEV_BRANCH}`, (job) => mergeInto(job, DEV_REPO, 'main', DEV_BRANCH)),
   step(`push ${DEV_BRANCH}`, async (job) => {
     const pushed = await gitInOrNull(DEV_REPO, 'push', 'origin', DEV_BRANCH)
     appendOutput(job, pushed === null ? `[skipped] could not push ${DEV_BRANCH}\n` : `pushed ${DEV_BRANCH}\n`)
@@ -1360,19 +1363,19 @@ const SELF_UPDATE_STEPS = [
 // One job moves one thing. Thus you always know what a button changes, and a
 // failure gives you one step to repeat.
 //
+//   pull-deploy    deploy <- origin/deploy. No build. No restart.
 //   main           main <- upstream/main. No merge into another branch.
-//   merge-deploy   deploy <- main. No build. No restart.
-//   merge-dev      dev <- deploy. No build. No restart.
+//   merge-main-dev dev <- main. No build. No restart.
 //   promote        deploy <- dev. No build. No restart.
 //   build          the source only. No install. No restart.
 //   deploy         the installation and the service only. No git. No compile.
 //
-// A full upgrade is main, merge-deploy, merge-dev, build, deploy. Each job is
-// separate, so a conflict in one leaves the other branches where they were.
+// A release update is pull-deploy, build, deploy. The integration jobs stay
+// separate. Thus one machine can update the shared deploy branch.
 const JOBS = {
+  'pull-deploy': [...PULL_DEPLOY_STEPS],
   main: [...MAIN_STEPS],
-  'merge-deploy': [...MERGE_DEPLOY_STEPS],
-  'merge-dev': [...MERGE_DEV_STEPS],
+  'merge-main-dev': [...MERGE_MAIN_DEV_STEPS],
   promote: [...PROMOTE_STEPS],
   build: [...BUILD_STEPS],
   deploy: [...DEPLOY_STEPS],
@@ -1572,12 +1575,12 @@ const MOCK_COMMITS = [
 // falls back to the npm release sections.
 const MOCK_SCENARIOS = {
   synced: {},
+  'deploy-behind': { fork: { remoteDeployBehind: 3 } },
   'upstream-behind': { fork: { mainBehind: 4, commits: MOCK_COMMITS } },
-  'merge-pending': { fork: { deployBehind: 2 } },
+  'merge-pending': { fork: { devBehindMain: 2 } },
   'build-stale': { fork: { tip: 'ef45ab1', needsRebuild: true } },
   deployable: { fork: { tip: 'ef45ab1', built: 'ef45ab1', needsDeploy: true } },
   'dev-ahead': { fork: { dev: { ahead: 3 } } },
-  'dev-behind': { fork: { dev: { behind: 2 } } },
   conflicts: {
     fork: {
       mainBehind: 2, clean: false, commits: MOCK_COMMITS.slice(0, 2),
@@ -1621,13 +1624,14 @@ function mockFork() {
     repo: '/mock/t3code/src', branch: 'deploy', checkedOut: 'deploy',
     head: 'ab12cd3', tip: 'ab12cd3', built: 'ab12cd3', deployed: 'ab12cd3',
     hasBuild: true, needsRebuild: false, needsDeploy: false, dirty: false,
-    mainBehind: 0, deployBehind: 0, clean: true, conflicts: [],
+    remoteDeployBehind: 0, remoteDeployAhead: 0,
+    mainBehind: 0, devBehindMain: 0, clean: true, conflicts: [],
     worktrees: [],
     ...rest,
     commits,
     dev: {
       repo: '/mock/t3code/dev', branch: 'dev', head: 'ab12cd3',
-      dirty: false, ahead: 0, behind: 0, clean: true, conflicts: [],
+      dirty: false, ahead: 0, clean: true, conflicts: [],
       ...dev,
     },
     active: mockState.job?.state === 'running' ? mockState.job.id : null,
@@ -2488,14 +2492,12 @@ const PAGE = String.raw`<!doctype html>
           <button id="fork-refresh" class="icon flat" title="Check for new upstream changes"
             aria-label="Check for new upstream changes">⟳</button>
         </h2>
-        <!-- The pipeline from upstream to the running service, one row per
+        <!-- The pipeline from the shared deploy branch to the service.
              step. The glyph gives the position in the flow, the meta gives
              what the step would act on, and the row itself is the action. -->
         <div class="steps" aria-label="Release pipeline">
-          <button class="step" id="job-main"><span class="glyph"></span>
-            <span class="lbl">Sync main</span><span class="meta" id="meta-main"></span></button>
-          <button class="step" id="job-merge-deploy"><span class="glyph"></span>
-            <span class="lbl">Merge into deploy</span><span class="meta" id="meta-merge"></span></button>
+          <button class="step" id="job-pull-deploy"><span class="glyph"></span>
+            <span class="lbl">Pull deploy</span><span class="meta" id="meta-pull-deploy"></span></button>
           <button class="step" id="build-run"><span class="glyph"></span>
             <span class="lbl">Build</span><span class="meta" id="meta-build"></span></button>
           <button class="step" id="build-deploy"><span class="glyph"></span>
@@ -2534,9 +2536,11 @@ const PAGE = String.raw`<!doctype html>
                deploy. Dev itself stays the staging pipeline below. -->
           <div class="steps" id="wt-list" hidden aria-label="Feature worktrees"></div>
           <button class="foldout" id="wt-new" style="margin-top:.4rem">+ new worktree</button>
-          <div class="steps" aria-label="Dev branch actions">
-            <button class="step" id="job-merge-dev"><span class="glyph"></span>
-              <span class="lbl">dev &larr; deploy</span><span class="meta" id="meta-merge-dev"></span></button>
+          <div class="steps" aria-label="Integration actions">
+            <button class="step" id="job-main"><span class="glyph"></span>
+              <span class="lbl">main &larr; upstream</span><span class="meta" id="meta-main"></span></button>
+            <button class="step" id="job-merge-main-dev"><span class="glyph"></span>
+              <span class="lbl">dev &larr; main</span><span class="meta" id="meta-merge-main-dev"></span></button>
             <button class="step" id="fork-promote"><span class="glyph"></span>
               <span class="lbl">deploy &larr; dev</span><span class="meta" id="meta-promote"></span></button>
           </div>
@@ -3012,10 +3016,11 @@ function renderFork(f) {
   $('fork-upstream-status').innerHTML = rows([
     ['worktree', esc(f.repo)],
     [f.branch + ' tip', esc(f.tip ?? '—')],
+    [f.branch + ' behind origin', String(f.remoteDeployBehind)],
     ['main behind upstream', String(f.mainBehind)],
-    [f.branch + ' behind main', String(f.deployBehind)],
+    [f.dev.branch + ' behind main', String(f.devBehindMain)],
   ])
-  const pending = f.mainBehind > 0 || f.deployBehind > 0
+  const pending = f.remoteDeployBehind > 0
   const blocked = f.dirty || !f.clean || !managed
   // Each button states only its own conditions. A sync and a promote move
   // branches, so they need clean worktrees but no managed service. A deploy
@@ -3030,18 +3035,17 @@ function renderFork(f) {
   lastWorktrees = f.worktrees ?? []
   forkBusy = busy
   renderWorktrees()
+  $('job-pull-deploy').disabled = busy || f.dirty || f.remoteDeployBehind === 0 || f.remoteDeployAhead > 0
   $('job-main').disabled = busy || f.mainBehind === 0
-  $('job-merge-deploy').disabled = busy || f.dirty || !f.clean || f.mainBehind > 0 || f.deployBehind === 0
-  $('job-merge-dev').disabled = busy || !hasDev || f.dev.dirty || f.dev.behind === 0
+  $('job-merge-main-dev').disabled = busy || f.dev.dirty || !f.clean || f.mainBehind > 0 || f.devBehindMain === 0
   $('fork-promote').disabled = busy || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0
   $('build-run').disabled = busy || !managed || f.dirty || !f.needsRebuild || pending
   $('build-deploy').disabled = busy || !managed || !f.needsDeploy || f.needsRebuild || pending
 
-  const flow = ['job-main', 'job-merge-deploy', 'build-run', 'build-deploy']
-  const currentStep = f.mainBehind > 0 ? 0
-    : f.deployBehind > 0 ? 1
-      : f.needsRebuild ? 2
-        : f.needsDeploy ? 3
+  const flow = ['job-pull-deploy', 'build-run', 'build-deploy']
+  const currentStep = f.remoteDeployBehind > 0 ? 0
+    : f.needsRebuild ? 1
+      : f.needsDeploy ? 2
           : flow.length
   for (const [index, id] of flow.entries()) {
     const button = $(id)
@@ -3051,12 +3055,16 @@ function renderFork(f) {
     else button.removeAttribute('aria-current')
   }
 
+  setStepMeta('meta-pull-deploy',
+    f.remoteDeployAhead > 0 ? 'local commits'
+      : f.remoteDeployBehind > 0 ? f.remoteDeployBehind + ' new' : 'current',
+    f.remoteDeployAhead > 0)
   setStepMeta('meta-main', f.mainBehind > 0 ? f.mainBehind + ' upstream' : 'synced')
-  setStepMeta('meta-merge',
+  setStepMeta('meta-merge-main-dev',
     !f.clean ? 'conflicts'
-      : f.dirty ? 'worktree dirty'
-      : f.deployBehind > 0 ? f.deployBehind + ' to merge' : 'merged',
-    !f.clean || f.dirty)
+      : f.dev.dirty ? 'dev dirty'
+      : f.devBehindMain > 0 ? f.devBehindMain + ' to merge' : 'merged',
+    !f.clean || f.dev.dirty)
   setStepMeta('meta-build',
     f.dirty ? 'worktree dirty'
       : !f.needsRebuild ? 'current'
@@ -3065,7 +3073,6 @@ function renderFork(f) {
   setStepMeta('meta-deploy',
     f.needsDeploy ? 'ready: ' + (f.built ?? '?')
       : f.deployed ? 'live @ ' + f.deployed : '—')
-  setStepMeta('meta-merge-dev', f.dev.behind > 0 ? f.dev.behind + ' to merge' : 'up to date')
   setStepMeta('meta-promote',
     !f.dev.clean ? 'conflicts'
       : f.dev.dirty ? 'dev dirty'
@@ -3276,7 +3283,7 @@ async function waitForRestart() {
 // Every job button, so a running job disables all of them and the page cannot
 // start a second job on the same repository.
 const JOB_BUTTONS = [
-  'job-main', 'job-merge-deploy', 'job-merge-dev', 'fork-promote', 'build-run', 'build-deploy',
+  'job-pull-deploy', 'job-main', 'job-merge-main-dev', 'fork-promote', 'build-run', 'build-deploy',
   'job-self-update',
 ]
 
@@ -3319,12 +3326,12 @@ function confirmAction(title, message) {
 // text is the button's tooltip, so you can read what a step does before you
 // click it.
 const JOB_UI = [
+  ['job-pull-deploy', 'pull-deploy', 'deploy ← origin/deploy',
+    'Pull the latest deploy branch. This builds nothing and restarts nothing.'],
   ['job-main', 'main', 'main ← upstream',
     'Move main to upstream/main, and push main. No other branch changes.'],
-  ['job-merge-deploy', 'merge-deploy', 'deploy ← main',
-    'Merge main into deploy, and push deploy. This builds nothing and restarts nothing.'],
-  ['job-merge-dev', 'merge-dev', 'dev ← deploy',
-    'Merge deploy into dev, and push dev. This builds nothing and restarts nothing.'],
+  ['job-merge-main-dev', 'merge-main-dev', 'dev ← main',
+    'Merge main into dev, and push dev. This builds nothing and restarts nothing.'],
   ['fork-promote', 'promote', 'deploy ← dev',
     'Merge dev into deploy, and push deploy. This builds nothing and restarts nothing.'],
   ['build-run', 'build', 'build',

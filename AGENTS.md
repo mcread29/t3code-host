@@ -85,10 +85,29 @@ env -i HOME=$HOME PATH="<the PATH of the unit>" npm uninstall -g no-such-package
 
 The exit code must be 0.
 
-The buttons in the dashboard follow the same rule. The jobs are `main`,
-`merge-deploy`, `merge-dev`, `promote`, `build`, and `deploy`. Each job moves
-one thing. Do not make a job that chains them, and do not add a merge to a job
-that builds.
+The buttons in the dashboard follow the same rule. The jobs are `pull-deploy`,
+`pull-dev`, `main`, `merge-main-dev`, `promote`, `build`, `deploy`, and
+`self-update`. Each job moves one thing. Do not make a job that chains them,
+and do not add a merge to a job that builds.
+
+## Keep the release machines out of the integration
+
+The dashboard has a settings dialog. It has one setting, and the setting is
+developer mode. Developer mode is off.
+
+A machine with developer mode off tracks `origin/deploy` only. It does not
+fetch `upstream`, it does not read `main`, and it does not read `dev`. The
+dashboard hides the dev section, and the server refuses each job that moves an
+integration branch. Thus two machines cannot move the shared branches together.
+
+Do not put a control for `main`, for `dev`, or for a feature worktree outside
+the dev section. Do not let a route give integration data when developer mode
+is off.
+
+The dashboard moves `main` to `origin/main` after each fetch, because nobody
+commits to `main`. It permits a fast-forward only. It moves `dev` with the
+`pull-dev` job, and not automatically, because `dev` has a worktree and a
+person works in it.
 
 ## Protect the production instance
 

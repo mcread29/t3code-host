@@ -46,6 +46,37 @@ const BUILT_SHA_PATH = join(STATE_DIR, 'built-sha')
 const DEPLOYED_SHA_PATH = join(STATE_DIR, 'deployed-sha')
 const T3_HOME = process.env.T3CODE_HOME ?? join(USER_HOME, '.t3')
 
+// ---------------------------------------------------------------------------
+// settings
+// ---------------------------------------------------------------------------
+
+// The settings of one machine. They live beside the other state of the
+// instance. Thus a reinstall keeps them, and each machine has its own.
+//
+// Developer mode is off. A machine in this mode tracks the deploy branch only.
+// It pulls `origin/deploy`, it builds, and it deploys. It does not track
+// `main`, it does not track `dev`, and it does not merge. Only the machine
+// that does the integration turns developer mode on. If each machine had the
+// integration controls, two machines could move the shared branches together.
+const SETTINGS_FILE = join(STATE_DIR, 'settings.json')
+const settings = { devMode: process.env.T3CODE_DEV_MODE === '1' }
+
+async function loadSettings() {
+  try {
+    const stored = JSON.parse(await readFile(SETTINGS_FILE, 'utf8'))
+    if (typeof stored.devMode === 'boolean') settings.devMode = stored.devMode
+  } catch {
+    // No file yet, or an unreadable one. The defaults above apply.
+  }
+}
+
+async function saveSettings() {
+  await mkdir(STATE_DIR, { recursive: true }).catch(() => {})
+  await writeFile(SETTINGS_FILE, `${JSON.stringify(settings, null, 2)}\n`)
+}
+
+await loadSettings()
+
 function samePath(first, second) {
   if (!first || !second) return first === second
   const normalize = (value) => {
@@ -297,9 +328,29 @@ async function gitInOrNull(worktree, ...args) {
 // A fetch changes the remote-tracking refs only. It does not change the
 // worktree or the build. Thus you can do it on demand and on the timer. A job
 // owns the repository while it runs, so this function stops during a job.
-function fetchRemotes() {
-  if (activeJob && jobs.get(activeJob)?.state === 'running') return Promise.resolve(null)
-  return gitOrNull('fetch', '--prune', '--multiple', 'origin', 'upstream')
+//
+// Only developer mode fetches `upstream`. A release machine reads one remote,
+// because it moves one branch.
+async function fetchRemotes() {
+  if (activeJob && jobs.get(activeJob)?.state === 'running') return null
+  const remotes = settings.devMode ? ['origin', 'upstream'] : ['origin']
+  const result = await gitOrNull('fetch', '--prune', '--multiple', ...remotes)
+  await syncMainFromOrigin()
+  return result
+}
+
+// `main` is a copy of upstream that the integration machine pushes. A local
+// `main` behind `origin/main` needs no decision, because nobody commits to it.
+// Thus the dashboard moves it. A `main` that is not an ancestor of
+// `origin/main` is a divergence, and a person must look at that.
+//
+// No worktree has `main` checked out, so this moves a ref and nothing else.
+async function syncMainFromOrigin() {
+  if (!REPO || !settings.devMode) return null
+  const behind = Number(await gitOrNull('rev-list', '--count', 'main..origin/main') ?? 0)
+  if (!behind) return null
+  if (await gitOrNull('merge-base', '--is-ancestor', 'main', 'origin/main') === null) return null
+  return gitOrNull('branch', '-f', 'main', 'origin/main')
 }
 
 async function gitOrNull(...args) {
@@ -354,22 +405,18 @@ async function deployedSha() {
   }
 }
 
-async function forkStatus() {
-  if (!REPO) return null
-
-  const [branch, head, dirty, remoteDeployBehind, remoteDeployAhead, mainBehind, devBehindMain, built, deployed, devHead, devDirty, devAhead] = await Promise.all([
-    gitOrNull('rev-parse', '--abbrev-ref', 'HEAD'),
-    gitOrNull('rev-parse', '--short', 'HEAD'),
-    gitOrNull('status', '--porcelain'),
-    gitOrNull('rev-list', '--count', `${BRANCH}..origin/${BRANCH}`),
-    gitOrNull('rev-list', '--count', `origin/${BRANCH}..${BRANCH}`),
+// The state of the integration branches. Only developer mode reads it. A
+// release machine does not track `main`, does not track `dev`, and thus pays
+// for none of these commands.
+async function integrationStatus() {
+  const [mainBehind, mainBehindOrigin, devBehindMain, devHead, devDirty, devAhead, devBehindOrigin] = await Promise.all([
     gitOrNull('rev-list', '--count', 'main..upstream/main'),
+    gitOrNull('rev-list', '--count', 'main..origin/main'),
     gitOrNull('rev-list', '--count', `${DEV_BRANCH}..main`),
-    builtSha(),
-    deployedSha(),
     DEV_REPO ? gitIn(DEV_REPO, 'rev-parse', '--short', 'HEAD').catch(() => null) : null,
     DEV_REPO ? gitIn(DEV_REPO, 'status', '--porcelain').catch(() => null) : null,
     gitOrNull('rev-list', '--count', `${BRANCH}..${DEV_BRANCH}`),
+    gitOrNull('rev-list', '--count', `${DEV_BRANCH}..origin/${DEV_BRANCH}`),
   ])
 
   // Preview both merges. The second one is checked against upstream/main
@@ -386,6 +433,56 @@ async function forkStatus() {
       : { clean: true, conflicts: [] },
   ])
 
+  return {
+    mainBehind: Number(mainBehind ?? 0),
+    // A count above zero here means that the automatic move did not happen.
+    // Thus `main` has commits that `origin/main` does not have.
+    mainBehindOrigin: Number(mainBehindOrigin ?? 0),
+    devBehindMain: Number(devBehindMain ?? 0),
+    dev: {
+      repo: DEV_REPO,
+      branch: DEV_BRANCH,
+      head: devHead,
+      dirty: Boolean(devDirty),
+      ahead: Number(devAhead ?? 0),
+      behindOrigin: Number(devBehindOrigin ?? 0),
+      clean: devPreview.clean,
+      conflicts: devPreview.conflicts,
+    },
+    clean: syncPreview.clean && mainDevPreview.clean,
+    conflicts: [...new Set([...syncPreview.conflicts, ...mainDevPreview.conflicts, ...devPreview.conflicts])],
+    worktrees: await worktreeStatus(),
+  }
+}
+
+// What the page shows when developer mode is off. Each field keeps its type,
+// so the page needs no second shape for a release machine.
+const NO_INTEGRATION = {
+  mainBehind: 0,
+  mainBehindOrigin: 0,
+  devBehindMain: 0,
+  dev: {
+    repo: null, branch: DEV_BRANCH, head: null,
+    dirty: false, ahead: 0, behindOrigin: 0, clean: true, conflicts: [],
+  },
+  clean: true,
+  conflicts: [],
+  worktrees: [],
+}
+
+async function forkStatus() {
+  if (!REPO) return null
+
+  const [branch, head, dirty, remoteDeployBehind, remoteDeployAhead, built, deployed] = await Promise.all([
+    gitOrNull('rev-parse', '--abbrev-ref', 'HEAD'),
+    gitOrNull('rev-parse', '--short', 'HEAD'),
+    gitOrNull('status', '--porcelain'),
+    gitOrNull('rev-list', '--count', `${BRANCH}..origin/${BRANCH}`),
+    gitOrNull('rev-list', '--count', `origin/${BRANCH}..${BRANCH}`),
+    builtSha(),
+    deployedSha(),
+  ])
+
   // Whether a build exists to deploy. The recorded revision is not the test: a
   // worktree can hold correct assets and no record, and a deploy of those
   // assets is correct.
@@ -393,11 +490,10 @@ async function forkStatus() {
     readFile(join(REPO, 'apps', 'server', asset)).then(() => true).catch(() => false),
   ))).every(Boolean)
 
-  const [tip, worktrees] = await Promise.all([
+  const [tip, integration] = await Promise.all([
     gitOrNull('rev-parse', '--short', BRANCH),
-    worktreeStatus(),
+    settings.devMode ? integrationStatus() : NO_INTEGRATION,
   ])
-  const conflicts = [...new Set([...syncPreview.conflicts, ...mainDevPreview.conflicts, ...devPreview.conflicts])]
 
   return {
     repo: REPO,
@@ -413,20 +509,8 @@ async function forkStatus() {
     dirty: Boolean(dirty),
     remoteDeployBehind: Number(remoteDeployBehind ?? 0),
     remoteDeployAhead: Number(remoteDeployAhead ?? 0),
-    mainBehind: Number(mainBehind ?? 0),
-    devBehindMain: Number(devBehindMain ?? 0),
-    dev: {
-      repo: DEV_REPO,
-      branch: DEV_BRANCH,
-      head: devHead,
-      dirty: Boolean(devDirty),
-      ahead: Number(devAhead ?? 0),
-      clean: devPreview.clean,
-      conflicts: devPreview.conflicts,
-    },
-    clean: syncPreview.clean && mainDevPreview.clean,
-    conflicts,
-    worktrees,
+    devMode: settings.devMode,
+    ...integration,
   }
 }
 
@@ -537,6 +621,7 @@ async function worktreeStatus() {
 }
 
 async function incomingCommits() {
+  if (!settings.devMode) return []
   const log = await gitOrNull('log', '--oneline', '--no-decorate', '-100', 'main..upstream/main')
   return log ? log.split('\n').filter(Boolean) : []
 }
@@ -738,7 +823,10 @@ const devRunner = {
 
 async function devRunnerStatus() {
   return {
-    configured: Boolean(DEV_REPO),
+    // The dev runner belongs to developer mode. A release machine serves the
+    // deploy build only.
+    devMode: settings.devMode,
+    configured: settings.devMode && Boolean(DEV_REPO),
     repo: DEV_REPO || null,
     branch: DEV_BRANCH,
     // Which worktree the runner serves, and the branch checked out there.
@@ -771,6 +859,7 @@ function readRunnerAnnouncements() {
 }
 
 async function startDevRunner(worktree) {
+  if (!settings.devMode) throw new Error('developer mode is off')
   if (!DEV_REPO) throw new Error('no development worktree is configured')
   if (devRunner.state === 'starting' || devRunner.state === 'running') return devRunnerStatus()
 
@@ -1273,6 +1362,17 @@ const PULL_DEPLOY_STEPS = [
   }),
 ]
 
+// The integration machine pushes `dev`. Thus a second developer machine can
+// be behind it. This job gets those commits. It permits a fast-forward only,
+// so it cannot overwrite work that is not pushed.
+const PULL_DEV_STEPS = [
+  guardDev,
+  step('fetch dev', (job) =>
+    exec(job, 'git', ['-C', DEV_REPO, 'fetch', '--prune', 'origin', DEV_BRANCH], { cwd: DEV_REPO })),
+  step(`move ${DEV_BRANCH} to origin/${DEV_BRANCH}`, (job) =>
+    exec(job, 'git', ['-C', DEV_REPO, 'merge', '--ff-only', `origin/${DEV_BRANCH}`], { cwd: DEV_REPO })),
+]
+
 const MERGE_MAIN_DEV_STEPS = [
   guardDev,
   step(`merge main into ${DEV_BRANCH}`, (job) => mergeInto(job, DEV_REPO, 'main', DEV_BRANCH)),
@@ -1364,6 +1464,7 @@ const SELF_UPDATE_STEPS = [
 // failure gives you one step to repeat.
 //
 //   pull-deploy    deploy <- origin/deploy. No build. No restart.
+//   pull-dev       dev <- origin/dev. No build. No restart.
 //   main           main <- upstream/main. No merge into another branch.
 //   merge-main-dev dev <- main. No build. No restart.
 //   promote        deploy <- dev. No build. No restart.
@@ -1374,6 +1475,7 @@ const SELF_UPDATE_STEPS = [
 // separate. Thus one machine can update the shared deploy branch.
 const JOBS = {
   'pull-deploy': [...PULL_DEPLOY_STEPS],
+  'pull-dev': [...PULL_DEV_STEPS],
   main: [...MAIN_STEPS],
   'merge-main-dev': [...MERGE_MAIN_DEV_STEPS],
   promote: [...PROMOTE_STEPS],
@@ -1497,7 +1599,17 @@ function parameterizedSteps(name, params) {
   return null
 }
 
+// The jobs that move `main`, `dev`, or a feature branch. They belong to the
+// integration machine. Thus developer mode must be on to start one.
+const DEV_MODE_JOBS = new Set([
+  'pull-dev', 'main', 'merge-main-dev', 'promote',
+  'merge-into-dev', 'promote-branch', 'worktree-create', 'worktree-remove',
+])
+
 function startJob(name, params = {}) {
+  if (DEV_MODE_JOBS.has(name) && !settings.devMode) {
+    throw new Error('developer mode is off, so this machine does not move the integration branches')
+  }
   const steps = JOBS[name] ?? parameterizedSteps(name, params)
   if (!steps) throw new Error(`unknown job: ${name}`)
   if (name === 'self-update' ? !HOST_REPO : !REPO) {
@@ -1578,6 +1690,10 @@ const MOCK_SCENARIOS = {
   'deploy-behind': { fork: { remoteDeployBehind: 3 } },
   'upstream-behind': { fork: { mainBehind: 4, commits: MOCK_COMMITS } },
   'merge-pending': { fork: { devBehindMain: 2 } },
+  'dev-behind-origin': { fork: { dev: { behindOrigin: 2 } } },
+  // main has a commit that origin/main does not have. Thus the dashboard does
+  // not move main, and it says so.
+  'main-diverged': { fork: { mainBehindOrigin: 1 } },
   'build-stale': { fork: { tip: 'ef45ab1', needsRebuild: true } },
   deployable: { fork: { tip: 'ef45ab1', built: 'ef45ab1', needsDeploy: true } },
   'dev-ahead': { fork: { dev: { ahead: 3 } } },
@@ -1610,7 +1726,9 @@ const MOCK_SCENARIOS = {
   },
 }
 
-const mockState = { scenario: 'synced', service: 'active', runner: 'stopped', job: null }
+// The mock starts in developer mode, so each scenario shows the dev section.
+// The settings dialog switches it, exactly as it does on a real machine.
+const mockState = { scenario: 'synced', service: 'active', runner: 'stopped', job: null, devMode: true }
 const mockJobs = new Map()
 
 function mockScenario() {
@@ -1620,22 +1738,26 @@ function mockScenario() {
 function mockFork() {
   const { dev = {}, ...rest } = mockScenario().fork ?? {}
   const commits = rest.commits ?? []
-  return {
+  const fork = {
     repo: '/mock/t3code/src', branch: 'deploy', checkedOut: 'deploy',
     head: 'ab12cd3', tip: 'ab12cd3', built: 'ab12cd3', deployed: 'ab12cd3',
     hasBuild: true, needsRebuild: false, needsDeploy: false, dirty: false,
     remoteDeployBehind: 0, remoteDeployAhead: 0,
-    mainBehind: 0, devBehindMain: 0, clean: true, conflicts: [],
+    mainBehind: 0, mainBehindOrigin: 0, devBehindMain: 0, clean: true, conflicts: [],
     worktrees: [],
     ...rest,
     commits,
+    devMode: mockState.devMode,
     dev: {
       repo: '/mock/t3code/dev', branch: 'dev', head: 'ab12cd3',
-      dirty: false, ahead: 0, clean: true, conflicts: [],
+      dirty: false, ahead: 0, behindOrigin: 0, clean: true, conflicts: [],
       ...dev,
     },
     active: mockState.job?.state === 'running' ? mockState.job.id : null,
   }
+  // A release machine reports no integration state at all. Thus the mock shows
+  // the page that machine gets, and not a hidden section with data behind it.
+  return mockState.devMode ? fork : { ...fork, ...NO_INTEGRATION, commits: [] }
 }
 
 function mockStatus() {
@@ -1660,7 +1782,8 @@ function mockRunnerStatus() {
     ? (mockScenario().fork?.worktrees ?? []).find((w) => w.path === worktree)?.branch ?? 'dev'
     : null
   return {
-    configured: true, repo: '/mock/t3code/dev', branch: 'dev',
+    devMode: mockState.devMode,
+    configured: mockState.devMode, repo: '/mock/t3code/dev', branch: 'dev',
     worktree, servingBranch: branch,
     state: mockState.runner,
     origin: mockState.runner === 'running' ? 'http://localhost:1' : null,
@@ -1750,6 +1873,15 @@ function mockApi(req, res, url) {
       mockState.service = MOCK_SCENARIOS[wanted].status?.active ?? 'active'
     }
     return json(res, 200, { scenario: mockState.scenario, scenarios: Object.keys(MOCK_SCENARIOS) })
+  }
+  if (path === '/_dash/settings') {
+    if (post) {
+      const wanted = url.searchParams.get('devMode')
+      if (wanted !== '0' && wanted !== '1') return json(res, 400, { error: 'devMode must be 0 or 1' })
+      mockState.devMode = wanted === '1'
+      if (!mockState.devMode) mockState.runner = 'stopped'
+    }
+    return json(res, 200, { devMode: mockState.devMode, devRepo: true })
   }
   if (path === '/_dash/status') return json(res, 200, mockStatus())
   if (path === '/_dash/latest') {
@@ -1885,6 +2017,28 @@ const server = createServer(async (req, res) => {
       if (!self) return json(res, 404, { error: 'the dashboard repo is not configured' })
       await gitHostOrNull('fetch', '--prune', 'origin')
       return json(res, 200, await selfStatus())
+    }
+
+    if (req.method === 'GET' && url.pathname === '/_dash/settings') {
+      return json(res, 200, { devMode: settings.devMode, devRepo: Boolean(DEV_REPO) })
+    }
+
+    // A change of developer mode changes what the page shows and what the
+    // machine tracks. It moves no branch, and it builds nothing.
+    if (req.method === 'POST' && url.pathname === '/_dash/settings') {
+      if (req.headers['x-token'] !== TOKEN) return json(res, 403, { error: 'bad token' })
+      const wanted = url.searchParams.get('devMode')
+      if (wanted !== '0' && wanted !== '1') {
+        return json(res, 400, { error: 'devMode must be 0 or 1' })
+      }
+      settings.devMode = wanted === '1'
+      await saveSettings()
+      // The dev console has no controls when the dev section is hidden. Thus
+      // a runner that operates now would have no way to stop.
+      if (!settings.devMode && devRunner.pid) await stopDevRunner()
+      // The counts of the new mode come from the remotes that it reads.
+      fetchRemotes().catch(() => {})
+      return json(res, 200, { devMode: settings.devMode, devRepo: Boolean(DEV_REPO) })
     }
 
     if (req.method === 'GET' && url.pathname === '/_dash/dev-runner') {
@@ -2085,6 +2239,7 @@ const PAGE = String.raw`<!doctype html>
     background:var(--bg);
     display:flex; align-items:center; gap:.55rem;
   }
+  .brand button.icon { margin-left:auto; }
   .mark { color:var(--accent); font-size:.78rem; font-weight:700; letter-spacing:-.02em; }
   .brand h1 {
     font-size:.78rem; font-weight:600; letter-spacing:.14em; margin:0;
@@ -2357,12 +2512,24 @@ const PAGE = String.raw`<!doctype html>
   .confirm-actions { display:flex; gap:.5rem; justify-content:flex-end; padding:.8rem .95rem .9rem; }
   .confirm-actions button { flex:0 0 auto; min-width:96px; }
 
-  dialog#new-wt {
+  dialog#new-wt, dialog#settings {
     width:min(420px, 90vw); padding:0; color:var(--text);
     background:var(--panel); border:1px solid var(--line); border-radius:12px;
     box-shadow:0 24px 60px -20px #000;
   }
-  dialog#new-wt::backdrop { background:rgba(0,0,0,.6); }
+  dialog#new-wt::backdrop, dialog#settings::backdrop { background:rgba(0,0,0,.6); }
+
+  /* One setting is one row: the name and its switch on one line, and the
+     reason for it below. Thus you read what the setting changes before you
+     change it. */
+  .setting {
+    display:grid; grid-template-columns:1fr auto; align-items:center;
+    gap:.25rem .8rem; padding:.85rem .95rem .2rem;
+  }
+  .setting .name { font-size:.82rem; color:var(--text); }
+  .setting .why { grid-column:1 / -1; color:var(--faint); font-size:.73rem; line-height:1.55; }
+  .setting input[type=checkbox] { width:16px; height:16px; accent-color:#2b4a5a; cursor:pointer; }
+  .setting input[type=checkbox]:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .field {
     display:block; padding:.7rem .95rem 0; color:var(--faint);
     font-size:.68rem; letter-spacing:.08em; text-transform:uppercase;
@@ -2455,6 +2622,7 @@ const PAGE = String.raw`<!doctype html>
     <div class="brand">
       <span class="mark">T3</span>
       <h1>service control</h1>
+      <button id="settings-open" class="icon" title="Settings" aria-label="Settings">⚙</button>
     </div>
 
     <div class="side-body">
@@ -2537,6 +2705,8 @@ const PAGE = String.raw`<!doctype html>
           <div class="steps" id="wt-list" hidden aria-label="Feature worktrees"></div>
           <button class="foldout" id="wt-new" style="margin-top:.4rem">+ new worktree</button>
           <div class="steps" aria-label="Integration actions">
+            <button class="step" id="job-pull-dev"><span class="glyph"></span>
+              <span class="lbl">dev &larr; origin</span><span class="meta" id="meta-pull-dev"></span></button>
             <button class="step" id="job-main"><span class="glyph"></span>
               <span class="lbl">main &larr; upstream</span><span class="meta" id="meta-main"></span></button>
             <button class="step" id="job-merge-main-dev"><span class="glyph"></span>
@@ -2598,6 +2768,24 @@ const PAGE = String.raw`<!doctype html>
         <button value="create" class="primary">Create</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- The settings of this machine. Developer mode is the one setting: it
+       decides whether this machine manages the integration branches, or only
+       gets the release and deploys it. -->
+  <dialog id="settings">
+    <div class="modal-head">
+      <span>settings</span>
+      <button id="settings-close" class="icon" title="Close" aria-label="Close">✕</button>
+    </div>
+    <div class="setting">
+      <label class="name" for="settings-dev-mode">Developer mode</label>
+      <input type="checkbox" id="settings-dev-mode">
+      <p class="why" id="settings-dev-why"></p>
+    </div>
+    <div class="confirm-actions">
+      <button id="settings-done" class="primary">Done</button>
+    </div>
   </dialog>
 
   <dialog id="confirm">
@@ -2860,6 +3048,74 @@ try {
   if (localStorage.getItem('t3code-sidebar') === 'collapsed') $('app').classList.add('collapsed')
 } catch {}
 
+// ---------------------------------------------------------------------------
+// settings
+// ---------------------------------------------------------------------------
+
+// Developer mode decides whether this machine manages the integration
+// branches. The page starts without the dev section, and shows it only after
+// the server confirms the mode. Thus a release machine never shows a control
+// that it refuses.
+let devMode = false
+
+function applyDevMode() {
+  $('dev-card').hidden = !devMode || !forkMode
+  $('settings-dev-mode').checked = devMode
+  $('settings-dev-why').textContent = devMode
+    ? 'This machine manages main and dev. It merges, it promotes, and it runs the dev server.'
+    : 'This machine gets the release only. It pulls origin/deploy, it builds, and it deploys.'
+  if (!devMode) {
+    $('frame-tabs').hidden = true
+    if (shownConsole === 'dev') showConsole('deploy')
+  }
+}
+
+function setDevMode(value) {
+  const changed = devMode !== value
+  devMode = value
+  applyDevMode()
+  return changed
+}
+
+async function refreshSettings() {
+  try {
+    const s = await (await fetch('/_dash/settings')).json()
+    setDevMode(Boolean(s.devMode))
+  } catch {
+    // Keep the last known mode on the screen.
+  }
+}
+
+$('settings-open').onclick = async () => {
+  await refreshSettings()
+  $('settings').showModal()
+}
+const closeSettings = () => $('settings').close()
+$('settings-close').onclick = closeSettings
+$('settings-done').onclick = closeSettings
+$('settings').onclick = (e) => { if (e.target === $('settings')) closeSettings() }
+
+$('settings-dev-mode').onchange = async (e) => {
+  const wanted = e.target.checked
+  e.target.disabled = true
+  try {
+    const res = await fetch('/_dash/settings?devMode=' + (wanted ? '1' : '0'), {
+      method: 'POST', headers: { 'x-token': TOKEN },
+    })
+    const s = await res.json()
+    if (!res.ok) throw new Error(s.error ?? 'could not save the setting')
+    setDevMode(Boolean(s.devMode))
+    log('developer mode: ' + (devMode ? 'on' : 'off'))
+    refreshFork()
+    refreshDevRunner()
+  } catch (err) {
+    log('settings failed: ' + err.message)
+    applyDevMode()
+  } finally {
+    e.target.disabled = false
+  }
+}
+
 let installed = null, latest = null, upToDate = null, managed = true
 
 function renderVersion() {
@@ -3002,26 +3258,30 @@ function setStepMeta(id, text, warn) {
 
 function renderFork(f) {
   $('fork-card').hidden = false
-  $('dev-card').hidden = false
   // The npm version line shows a release that this build does not come from.
   // Also, the update replaces the build of the fork. Thus remove the
   // section.
   $('version-card').hidden = true
   forkMode = true
+  setDevMode(f.devMode !== false)
 
   const flag = (text) => ' <span style="color:var(--amber)">(' + text + ')</span>'
   const rows = (items) => items
     .map(([k, v]) => '<div class="row"><dt>' + esc(k) + '</dt><dd>' + v + '</dd></div>').join('')
 
+  // A release machine tracks one branch. Thus its details name one branch.
   $('fork-upstream-status').innerHTML = rows([
     ['worktree', esc(f.repo)],
     [f.branch + ' tip', esc(f.tip ?? '—')],
     [f.branch + ' behind origin', String(f.remoteDeployBehind)],
-    ['main behind upstream', String(f.mainBehind)],
-    [f.dev.branch + ' behind main', String(f.devBehindMain)],
+    ...(devMode ? [
+      ['main behind upstream', String(f.mainBehind)],
+      ['main behind origin', String(f.mainBehindOrigin ?? 0)],
+      [f.dev.branch + ' behind origin', String(f.dev.behindOrigin ?? 0)],
+      [f.dev.branch + ' behind main', String(f.devBehindMain)],
+    ] : []),
   ])
   const pending = f.remoteDeployBehind > 0
-  const blocked = f.dirty || !f.clean || !managed
   // Each button states only its own conditions. A sync and a promote move
   // branches, so they need clean worktrees but no managed service. A deploy
   // restarts the service, so it needs the service but no clean worktree.
@@ -3036,6 +3296,7 @@ function renderFork(f) {
   forkBusy = busy
   renderWorktrees()
   $('job-pull-deploy').disabled = busy || f.dirty || f.remoteDeployBehind === 0 || f.remoteDeployAhead > 0
+  $('job-pull-dev').disabled = busy || f.dev.dirty || (f.dev.behindOrigin ?? 0) === 0
   $('job-main').disabled = busy || f.mainBehind === 0
   $('job-merge-main-dev').disabled = busy || f.dev.dirty || !f.clean || f.mainBehind > 0 || f.devBehindMain === 0
   $('fork-promote').disabled = busy || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0
@@ -3059,6 +3320,10 @@ function renderFork(f) {
     f.remoteDeployAhead > 0 ? 'local commits'
       : f.remoteDeployBehind > 0 ? f.remoteDeployBehind + ' new' : 'current',
     f.remoteDeployAhead > 0)
+  setStepMeta('meta-pull-dev',
+    f.dev.dirty ? 'dev dirty'
+      : (f.dev.behindOrigin ?? 0) > 0 ? f.dev.behindOrigin + ' new' : 'current',
+    f.dev.dirty)
   setStepMeta('meta-main', f.mainBehind > 0 ? f.mainBehind + ' upstream' : 'synced')
   setStepMeta('meta-merge-main-dev',
     !f.clean ? 'conflicts'
@@ -3087,11 +3352,20 @@ function renderFork(f) {
       ? '<span class="bad-text">Conflicts:</span> ' + esc(f.conflicts.join(', '))
       : ''
 
-  $('fork-dev-note').innerHTML = f.dev.dirty
-    ? '<span class="warn-text">Uncommitted changes</span> in ' + esc(f.dev.repo) + '. Commit before merging.'
-    : !f.dev.clean
-      ? '<span class="bad-text">Conflicts:</span> ' + esc(f.dev.conflicts.join(', '))
-      : ''
+  // The dashboard moves main to origin/main by itself, because nobody commits
+  // to main. A count that stays says that the move is not a fast-forward.
+  const mainNote = (f.mainBehindOrigin ?? 0) > 0
+    ? '<span class="warn-text">main did not move to origin/main.</span> ' +
+      'It has commits that origin/main does not have. Look at main in ' + esc(f.repo) + '.'
+    : ''
+  $('fork-dev-note').innerHTML = [
+    f.dev.dirty
+      ? '<span class="warn-text">Uncommitted changes</span> in ' + esc(f.dev.repo) + '. Commit before merging.'
+      : !f.dev.clean
+        ? '<span class="bad-text">Conflicts:</span> ' + esc(f.dev.conflicts.join(', '))
+        : '',
+    mainNote,
+  ].filter(Boolean).join('<br>')
 
   const box = $('fork-commits')
   box.innerHTML = f.commits.length
@@ -3283,8 +3557,8 @@ async function waitForRestart() {
 // Every job button, so a running job disables all of them and the page cannot
 // start a second job on the same repository.
 const JOB_BUTTONS = [
-  'job-pull-deploy', 'job-main', 'job-merge-main-dev', 'fork-promote', 'build-run', 'build-deploy',
-  'job-self-update',
+  'job-pull-deploy', 'job-pull-dev', 'job-main', 'job-merge-main-dev', 'fork-promote',
+  'build-run', 'build-deploy', 'job-self-update',
 ]
 
 const startJob = (name, branch) => startJobWith(name, branch ? { branch } : {})
@@ -3328,6 +3602,8 @@ function confirmAction(title, message) {
 const JOB_UI = [
   ['job-pull-deploy', 'pull-deploy', 'deploy ← origin/deploy',
     'Pull the latest deploy branch. This builds nothing and restarts nothing.'],
+  ['job-pull-dev', 'pull-dev', 'dev ← origin/dev',
+    'Pull the latest dev branch. This builds nothing and restarts nothing.'],
   ['job-main', 'main', 'main ← upstream',
     'Move main to upstream/main, and push main. No other branch changes.'],
   ['job-merge-main-dev', 'merge-main-dev', 'dev ← main',
@@ -3550,6 +3826,9 @@ function renderDevRunner(r) {
 }
 
 async function refreshDevRunner() {
+  // The dev runner belongs to the dev section. A release machine hides that
+  // section, so it asks for nothing.
+  if (!devMode) return
   try {
     renderDevRunner(await (await fetch('/_dash/dev-runner')).json())
   } catch {
@@ -3618,9 +3897,11 @@ initMock()
 
 refresh()
 checkUpdates()
+// The mode comes first. Thus the dev section appears only on a machine that
+// asked for it, and the runner poll starts only there.
+refreshSettings().then(refreshDevRunner)
 refreshFork()
 refreshSelf()
-refreshDevRunner()
 loadFrame()
 setInterval(refreshFork, 30000)
 setInterval(refreshSelf, 60000)

@@ -86,7 +86,6 @@ Each PowerShell script has the same function as its shell script:
 | --- | --- |
 | `install.sh` | `install.ps1` |
 | `units.sh` | `units.ps1` |
-| `update.sh` | `update.ps1` |
 | `refresh-dashboard.sh` | `refresh-dashboard.ps1` |
 | `uninstall.sh` | `uninstall.ps1` |
 | `check.sh` | `check.ps1` |
@@ -126,7 +125,6 @@ what a command stops.
 | `refresh-dashboard.sh` | the dashboard file | the dashboard | touch T3 Code |
 | `units.sh` | the units, the launcher, the dashboard, the Serve mapping | the dashboard | build, or touch T3 Code |
 | `install.sh` | each of those, and the build when the build is not current | the dashboard, and T3 Code only after a build | move a branch |
-| `update.sh` | the branches, the build | T3 Code | — |
 
 For a usual update after you get new commits:
 
@@ -202,23 +200,21 @@ T3CODE_FORCE_BUILD=1 T3CODE_INSTANCE=production ./install.sh
 
 The build stops T3 Code for a short time.
 
-To get the changes from the upstream project first:
-
-```bash
-T3CODE_INSTANCE=production ./update.sh
-```
+To get the changes from the upstream project, use the dashboard. The dev
+section moves `main`, `dev`, and `deploy`. Each button moves one branch.
 
 ### The dashboard buttons
 
 Each button moves one thing. The arrow gives the direction.
 
 ```text
-FORK   deploy <- origin    pulls the shared deploy branch. It does not push.
-FORK   main <- upstream    moves main only. It pushes main.
-DEV    dev <- main         merges main into dev. It pushes dev.
-DEV    deploy <- dev       promotes dev to deploy. It pushes deploy.
-BUILD  Build               compiles the source. No install. No restart.
-BUILD  Deploy              installs the build and restarts T3 Code. No compile.
+RELEASE  Pull deploy       pulls the shared deploy branch. It does not push.
+RELEASE  Build             compiles the source. No install. No restart.
+RELEASE  Deploy            installs the build and restarts T3 Code. No compile.
+DEV      dev <- origin     pulls the shared dev branch. It does not push.
+DEV      main <- upstream  moves main only. It pushes main.
+DEV      dev <- main       merges main into dev. It pushes dev.
+DEV      deploy <- dev     promotes dev to deploy. It pushes deploy.
 ```
 
 No button builds and merges together. No button merges two pairs of branches
@@ -230,13 +226,34 @@ A machine updates its release with these steps:
 deploy <- origin/deploy   ->   Build   ->   Deploy
 ```
 
-One integration machine updates `main` and `dev`. It promotes `dev` to
-`deploy`. Other machines pull `deploy`. Only **Deploy** stops your sessions.
+The DEV buttons need developer mode. Read **Developer mode** below. One
+integration machine updates `main` and `dev`. It promotes `dev` to `deploy`.
+Other machines pull `deploy`. Only **Deploy** stops your sessions.
 
-`update.sh` gets both remotes. It moves `main` forward to `upstream/main`. It
-looks for conflicts. It merges `main` into `deploy`. It builds the source. It
-installs the build. It starts the services again. It pushes `main` and `deploy`.
-If the build fails, the script does not push `deploy`.
+### Developer mode
+
+The dashboard has a settings dialog. The gear at the top of the sidebar opens
+it. The dialog has one setting, and that setting is developer mode.
+
+Developer mode is off. A machine in this state gets the release only:
+
+```text
+Pull deploy   ->   Build   ->   Deploy
+```
+
+The machine tracks `origin/deploy` alone. It does not fetch `upstream`, and it
+reads neither `main` nor `dev`. The dashboard hides the dev section, and the
+server refuses each job that moves an integration branch. Thus two machines
+cannot move the shared branches together, and a release machine shows only the
+three steps that it uses.
+
+Turn developer mode on for the integration machine. The dashboard then shows
+the dev section, the feature worktrees, and the dev server.
+
+The setting belongs to one machine. The dashboard writes it to
+`settings.json` in the state directory. Thus an update of the dashboard keeps
+it. To give a new machine the mode at the first start, set `T3CODE_DEV_MODE=1`
+in the environment of the dashboard. The file wins after that.
 
 ## Test an instance
 
@@ -309,9 +326,12 @@ worktree.
 ## The dev server
 
 To use the real T3 Code, open the production dashboard. The **dev** section has
-a **Start dev server** button. This button starts the dev runner of the fork in
-the development worktree. The runner serves that worktree from the source with
-hot reload.
+a **Start** button. This button starts the dev runner of the fork in the
+development worktree. The runner serves that worktree from the source with hot
+reload.
+
+The dev section needs developer mode. A machine with developer mode off shows
+no dev section and starts no dev runner.
 
 The dev server is not a systemd unit. Only one build owns the global `t3`
 package. That build is the deploy build. The dev server is a child of the
@@ -346,6 +366,15 @@ only. Thus the pull does not overwrite local commits.
 Use the integration controls on the integration machine. These controls move
 changes from `upstream` to `main`, then `dev`, and then `deploy`.
 
+Nobody commits to `main`, because `main` is a copy. Thus the dashboard moves
+`main` to `origin/main` by itself after each fetch. It permits a fast-forward
+only. If `main` has a commit of its own, the dashboard moves nothing and the
+dev section tells you.
+
+`dev` has a worktree, and a person works in it. Thus the dashboard does not
+move `dev` by itself. **dev &larr; origin** pulls what another machine pushed,
+and it permits a fast-forward only.
+
 Each merge does a fast-forward when the history permits one. It makes a merge
 commit only when the history does not permit a fast-forward.
 
@@ -362,8 +391,8 @@ dev server. The two worktrees must have no uncommitted changes.
 ## Safety
 
 The scripts that make changes need an instance name. `install.sh`,
-`uninstall.sh`, `update.sh`, and `refresh-dashboard.sh` stop with an error if
-you give no name.
+`uninstall.sh`, and `refresh-dashboard.sh` stop with an error if you give no
+name.
 
 The production instance also needs your approval. Type `production` when the
 script asks you. For an automatic procedure, set `T3CODE_YES=1`. Thus an
@@ -446,13 +475,15 @@ Set these variables when you install:
 | `T3CODE_UPSTREAM_URL` | `git@github.com:pingdotgg/t3code.git` |
 | `T3CODE_BRANCH` | `deploy` |
 | `T3CODE_DEV_BRANCH` | `dev` |
+| `T3CODE_DEV_MODE` | `0`, the mode before the first change in the dialog |
 
-The fork card shows the distance from `origin/deploy`. **Pull deploy** requires
-a clean worktree and a fast-forward. **Build** compiles the source. **Deploy**
-installs the build and restarts T3 Code.
+The release card shows the distance from `origin/deploy`. **Pull deploy**
+requires a clean worktree and a fast-forward. **Build** compiles the source.
+**Deploy** installs the build and restarts T3 Code.
 
-The dev card contains the integration controls. It also shows merge conflicts
-before a merge changes a worktree.
+The dev section contains the integration controls. It also shows merge
+conflicts before a merge changes a worktree. Developer mode gives this section.
+A machine that only runs the release does not show it.
 
 A build takes some minutes. Thus a build is a background job. The page reads the
 output. The output stays after you load the page again. Only one job runs at a
@@ -539,7 +570,6 @@ T3 Code also writes its messages to this file:
 | --- | --- |
 | `install.sh`, `install.ps1` | Install or update one instance. |
 | `refresh-dashboard.sh`, `refresh-dashboard.ps1` | Update one dashboard only. |
-| `update.sh`, `update.ps1` | Get, build, and install upstream changes. |
 | `uninstall.sh`, `uninstall.ps1` | Remove one instance. |
 | `check.sh`, `check.ps1` | Test one instance. |
 | `dev.sh`, `dev.ps1` | Run the dashboard shell with the stub. |

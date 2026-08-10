@@ -40,6 +40,28 @@ $upstreamUrl = Get-T3CodeEnvironment 'T3CODE_UPSTREAM_URL' 'git@github.com:pingd
 $branch = Get-T3CodeEnvironment 'T3CODE_BRANCH' 'deploy'
 $developmentBranch = Get-T3CodeEnvironment 'T3CODE_DEV_BRANCH' 'dev'
 $skipBuild = (Get-T3CodeEnvironment 'T3CODE_SKIP_BUILD' '0') -eq '1'
+$settingsPath = Join-Path $layout.StateDirectory 'settings.json'
+
+# Developer mode. A machine in this mode does the integration: it tracks
+# upstream, it keeps main and a dev worktree, and its dashboard shows the dev
+# section. Each other machine gets the release only. Thus it clones one branch,
+# it has one remote, and it has no second worktree.
+#
+# The dashboard owns the setting after the first install. This script reads
+# that file, so an install does not undo a choice you made in the dialog.
+$devModeNamed = -not [string]::IsNullOrWhiteSpace((Get-T3CodeEnvironment 'T3CODE_DEV_MODE' ''))
+if ($devModeNamed) {
+    $devMode = (Get-T3CodeEnvironment 'T3CODE_DEV_MODE' '0') -eq '1'
+} elseif (Test-Path -LiteralPath $settingsPath) {
+    $devMode = (Get-Content -LiteralPath $settingsPath -Raw) -match '"devMode"\s*:\s*true'
+} else {
+    $devMode = $false
+}
+if ($devMode) {
+    Write-Host 'Developer mode: on. This machine manages main, dev, and the promotions.'
+} else {
+    Write-Host "Developer mode: off. This machine gets the $branch release only."
+}
 
 $node = Get-T3CodeCommandPath @('node.exe')
 $npm = Get-T3CodeCommandPath @('npm.cmd')
@@ -69,6 +91,18 @@ foreach ($directory in $directories) {
     [IO.Directory]::CreateDirectory($directory) | Out-Null
 }
 
+# The dashboard shows the dev section from the setting file. It serves the
+# development worktree only when it has one, so a release machine gives it no
+# path.
+$unitDevelopmentRepository = if ($devMode) { $developmentRepository } else { '' }
+
+# Write the mode only when the file is absent, or when you named the mode. Thus
+# a plain install keeps the choice that the settings dialog made.
+if ($devModeNamed -or -not (Test-Path -LiteralPath $settingsPath)) {
+    $devModeJson = if ($devMode) { 'true' } else { 'false' }
+    Set-Content -LiteralPath $settingsPath -Value "{`n  `"devMode`": $devModeJson`n}" -Encoding utf8
+}
+
 $buildCurrent = $false
 $buildMade = $false
 $buildOk = $true
@@ -89,22 +123,58 @@ if ($skipBuild) {
 
         Write-Host "Preparing the fork checkout at $repository."
         if (-not (Test-Path -LiteralPath (Join-Path $repository '.git'))) {
-            Invoke-T3CodeNative $git clone $forkUrl $repository
+            if ($devMode) {
+                Invoke-T3CodeNative $git clone $forkUrl $repository
+            } else {
+                # One branch, because a release machine builds one branch.
+                Invoke-T3CodeNative $git clone --branch $branch --single-branch $forkUrl $repository
+            }
         }
-        & $git -C $repository remote get-url upstream *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Invoke-T3CodeNative $git -C $repository remote add upstream $upstreamUrl
+
+        if ($devMode) {
+            & $git -C $repository remote get-url upstream *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Invoke-T3CodeNative $git -C $repository remote add upstream $upstreamUrl
+            }
+            Invoke-T3CodeNative $git -C $repository fetch --prune --multiple origin upstream
+        } else {
+            # A release machine has one remote. Thus nothing on it tracks the
+            # upstream project, and the dashboard reads the branch it builds.
+            & $git -C $repository remote get-url upstream *> $null
+            if ($LASTEXITCODE -eq 0) {
+                Invoke-T3CodeNative $git -C $repository remote remove upstream
+                Write-Host 'Removed the upstream remote. Developer mode is off.'
+            }
+            Invoke-T3CodeNative $git -C $repository fetch --prune origin
         }
-        Invoke-T3CodeNative $git -C $repository fetch --prune --multiple origin upstream
+
+        # main mirrors upstream. Developer mode reads it, and it moves it. A
+        # clone makes it only when it is the default branch of the fork, so
+        # make it here. Without a local main, the dashboard reads no distance
+        # and each integration step says "synced" while it is not.
+        if ($devMode) {
+            & $git -C $repository show-ref --verify --quiet 'refs/heads/main'
+            if ($LASTEXITCODE -ne 0) {
+                & $git -C $repository show-ref --verify --quiet 'refs/remotes/origin/main'
+                if ($LASTEXITCODE -eq 0) {
+                    Invoke-T3CodeNative $git -C $repository branch main origin/main
+                } else {
+                    Invoke-T3CodeNative $git -C $repository branch main upstream/main
+                }
+                Write-Host 'Made the local main branch.'
+            }
+        }
 
         & $git -C $repository show-ref --verify --quiet "refs/heads/$branch"
         if ($LASTEXITCODE -ne 0) {
             & $git -C $repository show-ref --verify --quiet "refs/remotes/origin/$branch"
             if ($LASTEXITCODE -eq 0) {
                 Invoke-T3CodeNative $git -C $repository branch $branch "origin/$branch"
-            } else {
+            } elseif ($devMode) {
                 Invoke-T3CodeNative $git -C $repository branch $branch origin/main
                 Invoke-T3CodeNative $git -C $repository push -u origin $branch
+            } else {
+                throw "The fork has no origin/$branch branch. Make it on the machine that has developer mode on, and push it."
             }
         }
         Invoke-T3CodeNative $git -C $repository checkout $branch
@@ -117,7 +187,10 @@ if ($skipBuild) {
             Write-Host "Note: $repository has uncommitted changes. The build includes them."
         }
 
-        if (-not [IO.Path]::GetFullPath($developmentRepository).Equals(
+        # Developer mode alone makes the development worktree. A release
+        # machine never merges, so a second worktree there is a copy of the
+        # source that nothing reads.
+        if ($devMode -and -not [IO.Path]::GetFullPath($developmentRepository).Equals(
             [IO.Path]::GetFullPath($repository), [StringComparison]::OrdinalIgnoreCase)) {
             & $git -C $repository show-ref --verify --quiet "refs/heads/$developmentBranch"
             if ($LASTEXITCODE -ne 0) {
@@ -269,7 +342,7 @@ $taskEnvironment = [ordered]@{
     T3CODE_UNIT = "$($layout.TaskPath)$($layout.ServiceTask)"
     T3CODE_STATE_DIR = $layout.StateDirectory
     T3CODE_REPO = $repository
-    T3CODE_DEV_REPO = $developmentRepository
+    T3CODE_DEV_REPO = $unitDevelopmentRepository
     T3CODE_BRANCH = $branch
     T3CODE_DEV_BRANCH = $developmentBranch
     T3CODE_HOST_REPO = $root
@@ -347,15 +420,19 @@ if ((Get-T3CodeEnvironment 'T3CODE_SKIP_SERVE' '0') -eq '1') {
     Write-Host 'Skipping the Tailscale Serve mapping.'
 } else {
     Invoke-T3CodeNative $tailscale serve --bg "--https=$pairPort" "http://${dashboardHost}:$dashboardPort"
-    $devSite = Get-T3CodeServeSite -TailscalePath $tailscale -Port $devServePort
-    if (-not $devSite -or $devSite.Target -match ":$devConsolePort$") {
-        try {
-            Invoke-T3CodeNative $tailscale serve --bg "--https=$devServePort" "http://${dashboardHost}:$devConsolePort"
-        } catch {
-            Write-Warning "Tailscale Serve did not publish the development console on port $devServePort."
+    # The development console needs an HTTPS origin of its own. Only developer
+    # mode has that second console, so only it takes the second port.
+    if ($devMode) {
+        $devSite = Get-T3CodeServeSite -TailscalePath $tailscale -Port $devServePort
+        if (-not $devSite -or $devSite.Target -match ":$devConsolePort$") {
+            try {
+                Invoke-T3CodeNative $tailscale serve --bg "--https=$devServePort" "http://${dashboardHost}:$devConsolePort"
+            } catch {
+                Write-Warning "Tailscale Serve did not publish the development console on port $devServePort."
+            }
+        } else {
+            Write-Warning "Tailscale Serve port $devServePort already proxies to $($devSite.Target)."
         }
-    } else {
-        Write-Warning "Tailscale Serve port $devServePort already proxies to $($devSite.Target)."
     }
 }
 

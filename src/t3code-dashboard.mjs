@@ -5,9 +5,10 @@
 import { createServer, request as httpRequest } from 'node:http'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { Script } from 'node:vm'
 
 const run = promisify(execFile)
 
@@ -523,7 +524,6 @@ async function forkStatus() {
 // itself without touching T3 Code.
 const HOST_REPO = process.env.T3CODE_HOST_REPO ?? ''
 const DASH_UNIT = process.env.T3CODE_DASH_UNIT ?? ''
-const INSTANCE = process.env.T3CODE_INSTANCE ?? 'production'
 
 async function gitHostOrNull(...args) {
   try {
@@ -1410,8 +1410,27 @@ const PROMOTE_STEPS = [
   step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
 ]
 
-// The dashboard pulls its source. A detached process copies the file and
-// restarts the dashboard. The refresh does not name the T3 Code service.
+// The source of this dashboard, and the file that the service runs. The
+// running file is a copy, so an update replaces the copy.
+const SELF_SOURCE = HOST_REPO ? join(HOST_REPO, 'src', 't3code-dashboard.mjs') : ''
+const SELF_TARGET = process.argv[1]
+
+// The installed dashboard can be a link to the source. An update then needs
+// the restart alone, and a copy over the link would break the link.
+async function selfTargetIsLink() {
+  try {
+    const [source, target] = await Promise.all([realpath(SELF_SOURCE), realpath(SELF_TARGET)])
+    return samePath(source, target)
+  } catch {
+    return false
+  }
+}
+
+// The dashboard pulls its own source and replaces the file that it runs from.
+// A process cannot replace its own file and restart itself. Thus the last step
+// gives the copy and the restart to a process that this dashboard does not
+// own. That process does not name the T3 Code service, so an update of the
+// dashboard cannot stop a session in the console.
 const SELF_UPDATE_STEPS = [
   step('guard dashboard repo', async (job) => {
     if (await gitHostOrNull('status', '--porcelain')) {
@@ -1421,23 +1440,44 @@ const SELF_UPDATE_STEPS = [
   }),
   step('pull latest', (job) =>
     exec(job, 'git', ['-C', HOST_REPO, 'pull', '--ff-only'], { cwd: HOST_REPO })),
+  // The browser script is a template literal in the module. Thus a module that
+  // parses is no evidence that the page parses, and a page that does not parse
+  // is invisible on the server. Read both halves before you install the file.
+  step('verify the new source', async (job) => {
+    await exec(job, process.execPath, ['--check', SELF_SOURCE], { cwd: HOST_REPO })
+    const text = await readFile(SELF_SOURCE, 'utf8')
+    // Both markers are split, so this source does not hold a copy of either
+    // one. A whole marker here would be the first hit of the search below, and
+    // of the same search in the other tools that read this file.
+    const open = text.indexOf('<scr' + 'ipt>')
+    const close = text.indexOf('</scr' + 'ipt>')
+    if (open < 0 || close < 0) throw new Error('could not find the browser script in the new source')
+    new Script(text.slice(open + 8, close).replaceAll('__TOKEN__', 'x'), {
+      filename: 'dashboard page script',
+    })
+    appendOutput(job, 'the module and the page parse\n')
+  }),
   step('install and restart dashboard', async (job) => {
     if (!DASH_UNIT) {
       appendOutput(job, '[skipped] No dashboard service exists. Restart this source instance to apply the update.\n')
       return
     }
+    const linked = await selfTargetIsLink()
+    if (linked) appendOutput(job, `${SELF_TARGET} is a link to the source; the restart applies it.\n`)
+
     if (SCHEDULED_TASK) {
+      // The task holds the file open. Thus the copy waits for the stop, and
+      // the start waits for the copy.
+      const copy = linked ? '' :
+        `Copy-Item -LiteralPath '${SELF_SOURCE}' -Destination '${SELF_TARGET}' -Force; `
+      const command =
+        `schtasks.exe /End /TN '${DASH_UNIT}' | Out-Null; Start-Sleep -Seconds 2; ` +
+        copy +
+        `schtasks.exe /Run /TN '${DASH_UNIT}' | Out-Null`
       await new Promise((resolveLaunch, rejectLaunch) => {
         const child = spawn(POWERSHELL_BIN, [
-          '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-          '-File', join(HOST_REPO, 'refresh-dashboard.ps1'),
-        ], {
-          cwd: HOST_REPO,
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true,
-          env: { ...process.env, T3CODE_INSTANCE: INSTANCE, T3CODE_YES: '1' },
-        })
+          '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command,
+        ], { cwd: USER_HOME || undefined, detached: true, stdio: 'ignore', windowsHide: true })
         child.once('error', rejectLaunch)
         child.once('spawn', () => {
           child.unref()
@@ -1447,14 +1487,17 @@ const SELF_UPDATE_STEPS = [
       appendOutput(job, 'PowerShell owns the refresh. The dashboard restarts in a moment.\n')
       return
     }
+
+    // A transient unit outlives this process. Thus the restart below can stop
+    // the dashboard that started it.
+    const restart = `systemctl --user restart ${DASH_UNIT}`
     await exec(job, 'systemd-run', [
       '--user', '--collect',
       '--unit', `${DASH_UNIT.replace(/\.service$/, '')}-refresh`,
       // A transient unit needs the same command path as the dashboard.
       '--setenv', `PATH=${process.env.PATH}`,
-      '--setenv', `T3CODE_INSTANCE=${INSTANCE}`,
-      '--setenv', 'T3CODE_YES=1',
-      join(HOST_REPO, 'refresh-dashboard.sh'),
+      '/bin/sh', '-c',
+      linked ? restart : `install -m 0644 "${SELF_SOURCE}" "${SELF_TARGET}" && ${restart}`,
     ], { cwd: HOST_REPO })
     appendOutput(job, 'systemd owns the refresh. The dashboard restarts in a moment.\n')
   }),
@@ -2696,7 +2739,10 @@ const PAGE = String.raw`<!doctype html>
           <button id="dev-runner-toggle" class="hbtn"
             title="Runs the dev worktree from source with hot reload, alongside the deployed build.">Start</button>
         </h2>
-        <div class="dev-empty" id="dev-empty" hidden>No development worktree is configured.</div>
+        <!-- Developer mode without a development worktree: the machine was
+             installed for the release. The install makes the worktree. -->
+        <div class="dev-empty" id="dev-empty" hidden>No development worktree is configured.
+          Run <code>T3CODE_DEV_MODE=1 ./install.sh</code> on this machine to make one.</div>
         <div id="dev-content">
           <div class="dev-line" id="dev-line">—</div>
           <!-- One row per feature worktree: click the branch to serve it on

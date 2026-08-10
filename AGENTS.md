@@ -64,14 +64,20 @@ T3CODE_INSTANCE=production ./install.sh
 
 Each path has one blast radius. Keep it that way.
 
-| Command | It restarts |
+| Path | It restarts |
 | --- | --- |
+| the **Pull & restart** button | the dashboard |
 | `refresh-dashboard.sh` | the dashboard |
-| `units.sh` | the dashboard |
 | `install.sh` | the dashboard, and T3 Code only after a build |
 
+The dashboard updates itself. It pulls its repository, it reads both halves of
+the new file, and it gives the copy and the restart to a transient unit. Thus a
+process does not try to replace the file that it runs from. `install.sh` and
+`refresh-dashboard.sh` do the same work from a terminal, for a dashboard that
+does not start.
+
 Do not add a step to a path that changes a different group of parts. A user who
-runs `units.sh` must not lose the sessions in the console.
+updates the dashboard must not lose the sessions in the console.
 
 The units must give the directory of `mise` in the PATH, when the machine has
 `mise`. The npm shim calls `mise reshim` after a global install. Without `mise`

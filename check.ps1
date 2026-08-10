@@ -25,9 +25,14 @@ $hostAddress = Get-T3CodeTailnetAddress -TailscalePath $tailscale
 if (-not $hostAddress) {
     throw 'No Tailscale IPv4 address is available.'
 }
-$dashboardHost = Get-T3CodeEnvironment 'T3CODE_DASH_HOST' ''
-if (-not $dashboardHost -and (Test-Path -LiteralPath $layout.ConfigPath)) {
+# The task keeps the environment of the instance. Read it, and do not assume
+# the default paths: an instance can be pointed at any worktree.
+$savedConfig = $null
+if (Test-Path -LiteralPath $layout.ConfigPath) {
     $savedConfig = Get-Content -LiteralPath $layout.ConfigPath -Raw | ConvertFrom-Json
+}
+$dashboardHost = Get-T3CodeEnvironment 'T3CODE_DASH_HOST' ''
+if (-not $dashboardHost -and $savedConfig) {
     $dashboardHost = $savedConfig.Environment.T3CODE_DASH_HOST
 }
 if (-not $dashboardHost) {
@@ -184,6 +189,47 @@ if ($instance -eq 'production') {
     else { Add-Pass 'This instance has a separate data directory.' }
     if ($serveSite) { Add-Failure 'This instance uses the shared MagicDNS host. Disable its Serve mapping.' }
     else { Add-Pass 'This instance does not use the shared MagicDNS host.' }
+}
+
+# Developer mode decides what this machine tracks. A machine that carries the
+# parts of the other mode gets a state that nobody reads, and an integration
+# machine without them shows "synced" for a branch that it cannot see.
+Add-Section 'developer mode'
+$settingsPath = Join-Path $layout.StateDirectory 'settings.json'
+$devMode = $false
+if (Test-Path -LiteralPath $settingsPath) {
+    $devMode = (Get-Content -LiteralPath $settingsPath -Raw) -match '"devMode"\s*:\s*true'
+}
+$checkRepository = Get-T3CodeEnvironment 'T3CODE_REPO' $layout.Repository
+$checkDevRepository = Get-T3CodeEnvironment 'T3CODE_DEV_REPO' ''
+if (-not $checkDevRepository -and $savedConfig) {
+    $checkDevRepository = $savedConfig.Environment.T3CODE_DEV_REPO
+}
+if (-not $git -or -not (Test-Path -LiteralPath (Join-Path $checkRepository '.git'))) {
+    Add-Skip "The developer mode checks need a source checkout at $checkRepository."
+} else {
+    & $git.Source -C $checkRepository remote get-url upstream *> $null
+    $hasUpstream = $LASTEXITCODE -eq 0
+    & $git.Source -C $checkRepository show-ref --verify --quiet 'refs/heads/main'
+    $hasMain = $LASTEXITCODE -eq 0
+    if ($devMode) {
+        Add-Pass 'Developer mode is on. This machine manages the integration branches.'
+        if ($hasUpstream) { Add-Pass 'The upstream remote is configured.' }
+        else { Add-Failure 'Developer mode is on, but there is no upstream remote. Run install.ps1.' }
+        if ($hasMain) { Add-Pass 'The local main branch exists.' }
+        else { Add-Failure 'Developer mode is on, but there is no local main branch. Run install.ps1.' }
+        if ($checkDevRepository -and (Test-Path -LiteralPath (Join-Path $checkDevRepository '.git'))) {
+            Add-Pass "The development worktree is at $checkDevRepository."
+        } else {
+            Add-Failure 'Developer mode is on, but there is no development worktree. Run install.ps1 with T3CODE_DEV_MODE=1.'
+        }
+    } else {
+        Add-Pass 'Developer mode is off. This machine gets the release only.'
+        if ($hasUpstream) { Add-Failure 'The upstream remote is still configured. Run install.ps1.' }
+        else { Add-Pass 'There is no upstream remote.' }
+        if ($checkDevRepository) { Add-Failure 'The task gives a development worktree, but developer mode is off. Run install.ps1.' }
+        else { Add-Pass 'There is no development worktree.' }
+    }
 }
 
 Add-Section 'freshness'

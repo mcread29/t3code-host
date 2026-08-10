@@ -56,6 +56,28 @@ fork_url="${T3CODE_FORK_URL:-git@github.com:mcread29/t3code.git}"
 upstream_url="${T3CODE_UPSTREAM_URL:-git@github.com:pingdotgg/t3code.git}"
 branch="${T3CODE_BRANCH:-deploy}"
 dev_branch="${T3CODE_DEV_BRANCH:-dev}"
+settings_file="$state_dir/settings.json"
+
+# Developer mode. A machine in this mode does the integration: it tracks
+# upstream, it keeps main and a dev worktree, and its dashboard shows the dev
+# section. Each other machine gets the release only. Thus it clones one branch,
+# it has one remote, and it has no second worktree.
+#
+# The dashboard owns the setting after the first install. This script reads
+# that file, so an install does not undo a choice you made in the dialog.
+dev_mode="${T3CODE_DEV_MODE:-}"
+if [ -z "$dev_mode" ]; then
+  if grep -q '"devMode"[[:space:]]*:[[:space:]]*true' "$settings_file" 2>/dev/null; then
+    dev_mode=1
+  else
+    dev_mode=0
+  fi
+fi
+if [ "$dev_mode" = 1 ]; then
+  echo "Developer mode: on (this machine manages main, dev, and the promotions)."
+else
+  echo "Developer mode: off (this machine gets the $branch release only)."
+fi
 
 for command_name in node npm pnpm git tailscale systemctl; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -126,14 +148,12 @@ if [ -n "$npm_prefix" ]; then
   npm_install_args+=(--prefix "$npm_prefix")
 fi
 
-# Each path has one blast radius:
+# This script has one blast radius: the units, the launcher, the dashboard, the
+# Serve mapping, and the source build when that build is not current. It
+# restarts T3 Code only when it built something.
 #
-#   units.sh     the units, the launcher, the dashboard, and the Serve mapping.
-#                It restarts the dashboard. It does not touch T3 Code.
-#   install.sh   each of those, and the source build when the build is not
-#                current. It restarts T3 Code only when it built something.
-#
-# T3CODE_SKIP_BUILD=1 is what units.sh sets to get the first path.
+# T3CODE_SKIP_BUILD=1 leaves the build out. Use it for a change to a file in
+# systemd/ alone. The dashboard then restarts, and T3 Code does not.
 skip_build="${T3CODE_SKIP_BUILD:-0}"
 
 if [ "$skip_build" = 1 ]; then
@@ -155,20 +175,53 @@ echo "Preparing the fork checkout at $repo_dir..."
 # -e, not -d: a linked worktree's .git is a file. This lets an instance be
 # pointed at an existing worktree (T3CODE_REPO=.../dev) instead of a new clone.
 if [ ! -e "$repo_dir/.git" ]; then
-  git clone "$fork_url" "$repo_dir"
+  if [ "$dev_mode" = 1 ]; then
+    git clone "$fork_url" "$repo_dir"
+  else
+    # One branch, because a release machine builds one branch.
+    git clone --branch "$branch" --single-branch "$fork_url" "$repo_dir"
+  fi
 fi
-if ! git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; then
-  git -C "$repo_dir" remote add upstream "$upstream_url"
-fi
-git -C "$repo_dir" fetch --prune --multiple origin upstream
 
-# main mirrors upstream; "$branch" is the clean worktree that gets built and deployed.
+if [ "$dev_mode" = 1 ]; then
+  if ! git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; then
+    git -C "$repo_dir" remote add upstream "$upstream_url"
+  fi
+  git -C "$repo_dir" fetch --prune --multiple origin upstream
+else
+  # A release machine has one remote. Thus nothing on it tracks the upstream
+  # project, and the dashboard reads the branch that it builds.
+  if git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; then
+    git -C "$repo_dir" remote remove upstream
+    echo "Removed the upstream remote; developer mode is off."
+  fi
+  git -C "$repo_dir" fetch --prune origin
+fi
+
+# main mirrors upstream. Developer mode reads it, and it moves it. A clone
+# makes it only when it is the default branch of the fork, so make it here.
+# Without a local main, the dashboard reads no distance and each integration
+# step says "synced" while it is not.
+if [ "$dev_mode" = 1 ] && ! git -C "$repo_dir" show-ref --verify --quiet refs/heads/main; then
+  if git -C "$repo_dir" show-ref --verify --quiet refs/remotes/origin/main; then
+    git -C "$repo_dir" branch main origin/main
+  else
+    git -C "$repo_dir" branch main upstream/main
+  fi
+  echo "Made the local main branch."
+fi
+
+# "$branch" is the clean worktree that gets built and deployed.
 if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch"; then
   if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
     git -C "$repo_dir" branch "$branch" "origin/$branch"
-  else
+  elif [ "$dev_mode" = 1 ]; then
     git -C "$repo_dir" branch "$branch" origin/main
     git -C "$repo_dir" push -u origin "$branch"
+  else
+    echo "The fork has no origin/$branch branch." >&2
+    echo "Make it on the machine that has developer mode on, and push it." >&2
+    exit 1
   fi
 fi
 git -C "$repo_dir" checkout "$branch"
@@ -189,7 +242,10 @@ fi
 # uncommitted development files out of the dashboard-managed deploy worktree.
 # When the two are the same path the instance already builds development
 # directly, and there is no second worktree to create.
-if [ "$dev_dir" != "$repo_dir" ]; then
+#
+# Developer mode alone makes this worktree. A release machine never merges, so
+# a second worktree there is a copy of the source that nothing reads.
+if [ "$dev_mode" = 1 ] && [ "$dev_dir" != "$repo_dir" ]; then
   if ! git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$dev_branch"; then
     if git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$dev_branch"; then
       git -C "$repo_dir" branch "$dev_branch" "origin/$dev_branch"
@@ -272,6 +328,21 @@ fi
 install -d "$bin_dir" "$app_dir" "$state_dir" "$unit_dir" "$t3_home"
 install -m 0755 "$root/src/t3code-serve-tailnet" "$bin_dir/$serve_name"
 
+# Write the mode only when the file is absent, or when you named the mode. Thus
+# a plain install keeps the choice that the settings dialog made.
+if [ ! -f "$settings_file" ] || [ -n "${T3CODE_DEV_MODE:-}" ]; then
+  if [ "$dev_mode" = 1 ]; then dev_mode_json=true; else dev_mode_json=false; fi
+  printf '{\n  "devMode": %s\n}\n' "$dev_mode_json" >"$settings_file"
+fi
+
+# The dashboard shows the dev section from the setting above. It serves the dev
+# worktree only when it has one, so a release machine gives it no path.
+if [ "$dev_mode" = 1 ]; then
+  unit_dev_dir="$dev_dir"
+else
+  unit_dev_dir=""
+fi
+
 # Linking instead of copying lets an instance pick up dashboard edits from this
 # checkout on a plain `systemctl --user restart`, with no reinstall.
 if [ "${T3CODE_LINK_DASHBOARD:-0}" = 1 ]; then
@@ -283,8 +354,8 @@ else
 fi
 
 # A change to the T3 Code unit becomes active at the next restart of T3 Code.
-# This run restarts T3 Code only after a build, so a user who runs units.sh
-# gets a message and chooses the moment.
+# This run restarts T3 Code only after a build, so a run that compiled nothing
+# gives a message and lets you choose the moment.
 service_unit_before="$(cat "$unit_dir/$service_unit" 2>/dev/null || true)"
 
 sed \
@@ -314,7 +385,7 @@ sed \
   -e "s|@APP_DIR@|$app_dir|g" \
   -e "s|@STATE_DIR@|$state_dir|g" \
   -e "s|@REPO@|$repo_dir|g" \
-  -e "s|@DEV_REPO@|$dev_dir|g" \
+  -e "s|@DEV_REPO@|$unit_dev_dir|g" \
   -e "s|@BRANCH@|$branch|g" \
   -e "s|@DEV_BRANCH@|$dev_branch|g" \
   -e "s|@HOST_REPO@|$root|g" \
@@ -363,20 +434,23 @@ else
     exit 1
   fi
   # The dev console needs an HTTPS origin of its own: the deploy and dev
-  # consoles are mounted side by side, and one origin cannot serve both.
-  dev_serve_owner="$(serve_site "$dev_serve_port" | cut -f2)"
-  case "${dev_serve_owner:-}" in
-    '' | *":$dev_console_port")
-      if ! tailscale serve --bg --https="$dev_serve_port" "http://${host}:${dev_console_port}" >/dev/null; then
-        echo "Note: could not publish the dev console on HTTPS port $dev_serve_port." >&2
-        echo "      The dev tab will not work over HTTPS until it is mapped." >&2
-      fi
-      ;;
-    *)
-      echo "Note: Serve port $dev_serve_port already proxies to $dev_serve_owner; leaving it." >&2
-      echo "      Pick another with T3CODE_DEV_SERVE_PORT to publish the dev console." >&2
-      ;;
-  esac
+  # consoles are mounted side by side, and one origin cannot serve both. Only
+  # developer mode has that second console, so only it takes the second port.
+  if [ "$dev_mode" = 1 ]; then
+    dev_serve_owner="$(serve_site "$dev_serve_port" | cut -f2)"
+    case "${dev_serve_owner:-}" in
+      '' | *":$dev_console_port")
+        if ! tailscale serve --bg --https="$dev_serve_port" "http://${host}:${dev_console_port}" >/dev/null; then
+          echo "Note: could not publish the dev console on HTTPS port $dev_serve_port." >&2
+          echo "      The dev tab will not work over HTTPS until it is mapped." >&2
+        fi
+        ;;
+      *)
+        echo "Note: Serve port $dev_serve_port already proxies to $dev_serve_owner; leaving it." >&2
+        echo "      Pick another with T3CODE_DEV_SERVE_PORT to publish the dev console." >&2
+        ;;
+    esac
+  fi
 fi
 
 serve_url="$(serve_site "$pair_port" | cut -f1)"

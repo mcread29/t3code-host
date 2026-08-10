@@ -65,6 +65,26 @@ source. The build takes some minutes.
 You must give the instance name. A command without a name stops with an error.
 This prevents accidental changes to the production instance.
 
+### Developer mode at the install
+
+Developer mode is off. The installer then clones one branch of the fork, it
+adds no upstream remote, and it makes no development worktree. Thus a release
+machine holds only the parts that it uses.
+
+Give the mode for a machine that does the integration:
+
+```bash
+T3CODE_DEV_MODE=1 T3CODE_INSTANCE=production ./install.sh
+```
+
+The installer writes the mode to `settings.json` in the state directory. It
+writes that file again only when you name the mode. Thus a later change in the
+settings dialog of the dashboard stays. Read **Developer mode** below.
+
+Run the command again with `T3CODE_DEV_MODE=1` after you turn the mode on in
+the dialog. The installer then adds the upstream remote, the `main` branch, and
+the development worktree to a machine that did not have them.
+
 The installer does these steps:
 
 1. It installs the global `t3` package. This package is the fallback.
@@ -85,7 +105,6 @@ Each PowerShell script has the same function as its shell script:
 | Linux | Windows |
 | --- | --- |
 | `install.sh` | `install.ps1` |
-| `units.sh` | `units.ps1` |
 | `refresh-dashboard.sh` | `refresh-dashboard.ps1` |
 | `uninstall.sh` | `uninstall.ps1` |
 | `check.sh` | `check.ps1` |
@@ -117,13 +136,17 @@ get the dashboard page directly.
 
 ## Update one machine
 
+The dashboard does each usual update. Use a script for the first install, and
+for a machine that you cannot reach through its dashboard.
+
 Each path changes one group of parts, and no other part. Thus you always know
 what a command stops.
 
-| Command | It changes | It restarts | It does not |
+| Path | It changes | It restarts | It does not |
 | --- | --- | --- | --- |
+| **Pull deploy**, **Build**, **Deploy** | the branch, the build, the installation | T3 Code, at **Deploy** only | move another branch |
+| **Pull & restart** | the dashboard file | the dashboard | touch T3 Code |
 | `refresh-dashboard.sh` | the dashboard file | the dashboard | touch T3 Code |
-| `units.sh` | the units, the launcher, the dashboard, the Serve mapping | the dashboard | build, or touch T3 Code |
 | `install.sh` | each of those, and the build when the build is not current | the dashboard, and T3 Code only after a build | move a branch |
 
 For a usual update after you get new commits:
@@ -141,11 +164,11 @@ build, or when a build asset is absent. It restarts T3 Code only when it built
 something. Thus an update that changes the dashboard only takes seconds, and
 your sessions in the console continue.
 
-For a change to a file in `systemd/` or to the dashboard, and for no change to
-T3 Code:
+For a change to a file in `systemd/` and no change to T3 Code, leave the build
+out:
 
 ```bash
-T3CODE_INSTANCE=production ./units.sh
+T3CODE_SKIP_BUILD=1 T3CODE_INSTANCE=production ./install.sh
 ```
 
 A change to the T3 Code unit becomes active at the next restart of T3 Code. The
@@ -170,24 +193,23 @@ call fails with code 127. Two operations then fail after a correct install:
 
 ## Update the dashboard
 
-Use this procedure when you change only `src/t3code-dashboard.mjs`. The
-procedure takes some seconds. It does not build T3 Code. It does not stop T3
+The dashboard updates itself. Use **Pull & restart** in the dashboard section.
+The update takes some seconds. It does not build T3 Code. It does not stop T3
 Code. Thus your sessions continue.
 
-1. Update the dashboard:
+The job does these steps. It makes sure that the repository is clean. It pulls
+the repository. It reads the module and the page of the new file. It gives the
+copy and the restart to a transient unit, because a process cannot replace the
+file that it runs from. The name of the T3 Code service is in no step. Thus the
+update cannot stop T3 Code.
 
-   ```bash
-   T3CODE_INSTANCE=production ./refresh-dashboard.sh
-   ```
+Use the script when the dashboard does not start:
 
-2. Type `production` when the script asks you.
+```bash
+T3CODE_INSTANCE=production ./refresh-dashboard.sh
+```
 
-The script does these steps. It reads the source. It makes sure that the source
-is correct. It copies the source. It starts the dashboard service again. It
-runs `check.sh`.
-
-The script does not use `install.sh`. The name of the T3 Code service is not in
-the script. Thus the script cannot stop T3 Code.
+The script does the same steps from a terminal, and then runs `check.sh`.
 
 ## Update T3 Code
 
@@ -252,8 +274,18 @@ the dev section, the feature worktrees, and the dev server.
 
 The setting belongs to one machine. The dashboard writes it to
 `settings.json` in the state directory. Thus an update of the dashboard keeps
-it. To give a new machine the mode at the first start, set `T3CODE_DEV_MODE=1`
-in the environment of the dashboard. The file wins after that.
+it.
+
+The dialog changes what the dashboard shows and what it tracks. It makes no
+worktree. Thus you run the installer again after you turn the mode on:
+
+```bash
+T3CODE_DEV_MODE=1 T3CODE_INSTANCE=production ./install.sh
+```
+
+That command adds the upstream remote, the `main` branch, and the development
+worktree. Until it runs, the dev section says that no development worktree
+exists.
 
 ## Test an instance
 
@@ -533,6 +565,7 @@ them.
 | `T3CODE_SKIP_SERVE` | Set to `1` to publish no Tailscale Serve address. |
 | `T3CODE_ALLOW_DIRTY` | Set to `1` to build a worktree with local changes. |
 | `T3CODE_LINK_DASHBOARD` | Set to `1` to link the dashboard file to this repository. |
+| `T3CODE_DEV_MODE` | Set to `1` for an integration machine, or `0` for a release machine. |
 | `T3CODE_CHANNEL` | The npm channel for the fallback package. |
 
 Each Tailscale Serve port uses the same MagicDNS host name. Cookies ignore port
@@ -573,7 +606,6 @@ T3 Code also writes its messages to this file:
 | `uninstall.sh`, `uninstall.ps1` | Remove one instance. |
 | `check.sh`, `check.ps1` | Test one instance. |
 | `dev.sh`, `dev.ps1` | Run the dashboard shell with the stub. |
-| `units.sh`, `units.ps1` | Update service files without a build. |
 | `AGENTS.md` | Give the rules for an agent that works here. |
 | `lib/guard.sh`, `lib/Guard.ps1` | Protect the production instance. |
 | `lib/Windows.ps1` | Give shared Windows functions. |

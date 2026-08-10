@@ -35,8 +35,12 @@ state_dir="${HOME}/.local/state/$app_name"
 # Ask the unit which checkout it deploys rather than assuming the default; an
 # instance can be pointed at any worktree, as ./dev.sh does.
 unit_env="$(systemctl --user show "$dashboard_unit" -p Environment --value 2>/dev/null)"
-unit_repo="$(tr ' ' '\n' <<<"$unit_env" | sed -n 's/^T3CODE_REPO=//p' | head -n1)"
+unit_value() { tr ' ' '\n' <<<"$unit_env" | sed -n "s/^$1=//p" | head -n1; }
+unit_repo="$(unit_value T3CODE_REPO)"
 repo_dir="${T3CODE_REPO:-${unit_repo:-${HOME}/.local/share/$app_name/src}}"
+dev_repo="$(unit_value T3CODE_DEV_REPO)"
+branch="$(unit_value T3CODE_BRANCH)"
+branch="${branch:-deploy}"
 
 passed=0
 failed=0
@@ -311,6 +315,46 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Developer mode decides what this machine tracks. A machine that carries the
+# parts of the other mode gets a state that nobody reads, and an integration
+# machine without them shows "synced" for a branch that it cannot see.
+note "developer mode"
+if grep -q '"devMode"[[:space:]]*:[[:space:]]*true' "$state_dir/settings.json" 2>/dev/null; then
+  dev_mode=1
+else
+  dev_mode=0
+fi
+has_upstream() { git -C "$repo_dir" remote get-url upstream >/dev/null 2>&1; }
+
+if [ ! -e "$repo_dir/.git" ]; then
+  skip "developer mode checks (no source checkout at $repo_dir)"
+elif [ "$dev_mode" = 1 ]; then
+  ok "developer mode is on; this machine manages the integration branches"
+  if has_upstream; then ok "the upstream remote is configured"
+  else bad "developer mode is on, but there is no upstream remote; run ./install.sh"; fi
+  if git -C "$repo_dir" show-ref --verify --quiet refs/heads/main; then ok "the local main branch exists"
+  else bad "developer mode is on, but there is no local main branch; run ./install.sh"; fi
+  if [ -z "$dev_repo" ]; then
+    bad "developer mode is on, but the unit gives no development worktree"
+    echo "        T3CODE_DEV_MODE=1 ./install.sh"
+  elif [ -e "$dev_repo/.git" ]; then
+    ok "development worktree at $dev_repo"
+  else
+    bad "no development worktree at $dev_repo"
+    echo "        T3CODE_DEV_MODE=1 ./install.sh"
+  fi
+else
+  ok "developer mode is off; this machine gets the $branch release only"
+  if has_upstream; then bad "the upstream remote is still configured; run ./install.sh"
+  else ok "no upstream remote"; fi
+  if [ -n "$dev_repo" ]; then
+    bad "the unit gives a development worktree, but developer mode is off; run ./install.sh"
+  else
+    ok "no development worktree"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 note "freshness"
 # ---------------------------------------------------------------------------
 # A stale process that still passes every check above is the worst failure mode
@@ -359,7 +403,7 @@ if [ -e "$repo_dir/.git" ]; then
       -print -quit 2>/dev/null)"
     if [ -n "$newest" ]; then
       bad "source edited since the last build (e.g. ${newest#"$repo_dir"/}); rebuild"
-      echo "        ./dev.sh build"
+      echo "        Use Build in the dashboard."
     else
       ok "worktree is dirty but nothing newer than the build"
     fi

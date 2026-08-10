@@ -2419,11 +2419,6 @@ const PAGE = String.raw`<!doctype html>
   .dot.mini { width:7px; height:7px; vertical-align:baseline; }
   button.icon.flat[data-spin] { animation:spin .8s linear infinite; }
 
-  .row { display:flex; justify-content:space-between; gap:1rem; padding:.12rem 0; font-size:.78rem; }
-  .row dt { color:var(--dim); white-space:nowrap; }
-  .row dd { margin:0; text-align:right; word-break:break-all; color:#d4d4d8; }
-  dl { margin:0; }
-
   /* status ---------------------------------------------------------------- */
   .state {
     display:flex; align-items:center; gap:.55rem; padding:0 0 .55rem; min-height:30px;
@@ -2568,38 +2563,13 @@ const PAGE = String.raw`<!doctype html>
   .dev-line { color:var(--faint); font-size:.72rem; margin:0 0 .6rem; word-break:break-all; }
   .steps + .steps { margin-top:.45rem; }
 
-  /* Each section keeps its natural height. The open foldout takes the
-     remaining space. The body of the foldout scrolls, and not the section.
-     Each element in this chain needs min-height:0. If an element does not have
-     it, the flex item does not become smaller than its content, and the
-     sidebar gets the overflow. */
+  /* Each section keeps its natural height, and the sidebar scrolls. The one
+     open-ended list is the incoming upstream commits. That list gets a
+     maximum height and scrolls in itself, so no section can grow without a
+     limit and no flex chain has to give it the leftover height. */
   .card { flex:none; }
-  /* The card gives the minimum height. Do not use min-height:auto here. The
-     card is not a scroll container. Thus its automatic minimum is all of its
-     content, which includes the full list of commits, and the foldout never
-     gets a maximum height. With this value, the card becomes as small as the
-     fixed rows and a list that you can read. The sidebar then scrolls. */
-  #fork-card { display:flex; flex-direction:column; min-height:0; }
-  #fork-card.expanded { flex:1 1 auto; min-height:21rem; }
-  /* The overflow:hidden rule is a protection. If the chain becomes smaller
-     than the minimum height of the card, the list is cut. It does not go
-     across the section below it. */
-  .more { display:flex; flex-direction:column; min-height:0; flex:1 1 auto; margin-top:.75rem;
-          position:relative; overflow:hidden; }
-  /* This space keeps the values at the right away from the scrollbar. It also
-     keeps the last row away from the bottom edge. */
-  .more-body { flex:1 1 auto; min-height:0; padding:0 .7rem .6rem 0; }
-  .more-body > * { margin-top:.5rem; }
-  .more-body > *:first-child { margin-top:0; }
-  /* A cut through a line of text looks like a fault. Thus the last rows become
-     less bright. This shows that more content is below. The effect stops when
-     you get to the end. */
-  .more::after {
-    content:''; position:absolute; left:0; right:.7rem; bottom:0; height:2rem;
-    background:linear-gradient(180deg, rgba(10,10,11,0), var(--bg) 90%);
-    pointer-events:none; transition:opacity .15s ease;
-  }
-  .more[data-at-end]::after { opacity:0; }
+  #dev-incoming { margin-top:.6rem; }
+  #dev-details-body { max-height:15rem; margin-top:.35rem; padding-right:.6rem; }
 
 
   .foldout {
@@ -2834,6 +2804,7 @@ const PAGE = String.raw`<!doctype html>
           <button id="fork-refresh" class="icon flat" title="Check for new upstream changes"
             aria-label="Check for new upstream changes">⟳</button>
         </h2>
+        <div class="dev-line" id="release-line">—</div>
         <!-- The pipeline from the shared deploy branch to the service.
              step. The glyph gives the position in the flow, the meta gives
              what the step would act on, and the row itself is the action. -->
@@ -2846,19 +2817,6 @@ const PAGE = String.raw`<!doctype html>
             <span class="lbl">Deploy</span><span class="meta" id="meta-deploy"></span></button>
         </div>
         <div id="fork-note" class="note"></div>
-        <!-- Not a <details>: that element slots its content into a UA shadow
-             tree, so the body is not a flex child of it and cannot be given
-             the leftover height to scroll in. A plain button and div can. -->
-        <div class="more">
-          <button id="fork-details" class="foldout" aria-expanded="false"
-            aria-controls="fork-details-body">Details</button>
-          <!-- Only the upstream detail folds away: it is the one open-ended
-               list. Dev and the build are short and always worth seeing. -->
-          <div class="more-body scrolls" id="fork-details-body" hidden>
-            <dl id="fork-upstream-status"></dl>
-            <div id="fork-commits" hidden></div>
-          </div>
-        </div>
       </section>
 
       <!-- The dev server lives in the heading, mirroring the service line at
@@ -2901,6 +2859,14 @@ const PAGE = String.raw`<!doctype html>
               <span class="lbl">main &rarr; dev</span><span class="meta" id="meta-merge-main-dev"></span></button>
             <button class="step" id="fork-promote"><span class="glyph" data-step="4"></span>
               <span class="lbl">dev &rarr; deploy</span><span class="meta" id="meta-promote"></span></button>
+          </div>
+          <!-- What step 2 would bring in. It is the one open-ended list in the
+               sidebar, so it folds away and it scrolls in itself. It shows
+               only while upstream has commits that main does not have. -->
+          <div id="dev-incoming" hidden>
+            <button id="dev-details" class="foldout" aria-expanded="false"
+              aria-controls="dev-details-body">Incoming from upstream</button>
+            <div class="scrolls" id="dev-details-body" hidden></div>
           </div>
           <!-- One row per feature worktree: click the branch to serve it on
                the dev tab; the icons commit, push, merge it into dev, or
@@ -3488,21 +3454,10 @@ function renderFork(f) {
   setDevMode(f.devMode !== false)
 
   const flag = (text) => ' <span style="color:var(--amber)">(' + text + ')</span>'
-  const rows = (items) => items
-    .map(([k, v]) => '<div class="row"><dt>' + esc(k) + '</dt><dd>' + v + '</dd></div>').join('')
-
-  // A release machine tracks one branch. Thus its details name one branch.
-  $('fork-upstream-status').innerHTML = rows([
-    ['worktree', esc(f.repo)],
-    [f.branch + ' tip', esc(f.tip ?? '—')],
-    [f.branch + ' behind origin', String(f.remoteDeployBehind)],
-    ...(devMode ? [
-      ['main behind upstream', String(f.mainBehind)],
-      ['main behind origin', String(f.mainBehindOrigin ?? 0)],
-      [f.dev.branch + ' behind origin', String(f.dev.behindOrigin ?? 0)],
-      [f.dev.branch + ' behind main', String(f.devBehindMain)],
-    ] : []),
-  ])
+  // The worktree of the release, and where its branch stands. Each count that
+  // this line once carried is the meta of the step that acts on it.
+  $('release-line').innerHTML = esc(f.repo) + ' &middot; ' + esc(f.branch) +
+    ' @ ' + esc(f.tip ?? '—') + (f.dirty ? flag('dirty') : '')
   const pending = f.remoteDeployBehind > 0
   // Each button states only its own conditions. A sync and a promote move
   // branches, so they need clean worktrees but no managed service. A deploy
@@ -3593,36 +3548,19 @@ function renderFork(f) {
     mainNote,
   ].filter(Boolean).join('<br>')
 
-  const box = $('fork-commits')
-  box.innerHTML = f.commits.length
-    ? '<p class="sub">incoming</p>' + commitRows(f.commits)
-    : ''
-  box.hidden = !f.commits.length
-  // New commits change the quantity of content. Thus calculate the effect
-  // again.
-  markScrollEnd()
+  // The commits that step 2 would bring in. No commits means no foldout.
+  $('dev-details-body').innerHTML = f.commits.length ? commitRows(f.commits) : ''
+  $('dev-incoming').hidden = !f.commits.length
 }
 
-// When you open the foldout, it takes the remaining height of the sidebar.
-// Thus the body of the foldout scrolls, and no other element scrolls.
-$('fork-details').onclick = () => {
-  const body = $('fork-details-body')
+// The list has a maximum height and it scrolls in itself. Thus the foldout
+// needs no height from the sidebar, and no other element scrolls.
+$('dev-details').onclick = () => {
+  const body = $('dev-details-body')
   const expanded = body.hidden
   body.hidden = !expanded
-  $('fork-details').setAttribute('aria-expanded', String(expanded))
-  $('fork-card').classList.toggle('expanded', expanded)
-  markScrollEnd()
+  $('dev-details').setAttribute('aria-expanded', String(expanded))
 }
-
-// This function controls the effect at the bottom. The effect applies only
-// while more content is below.
-function markScrollEnd() {
-  const body = $('fork-details-body')
-  const atEnd = body.scrollTop + body.clientHeight >= body.scrollHeight - 4
-  body.parentElement.toggleAttribute('data-at-end', atEnd)
-}
-$('fork-details-body').addEventListener('scroll', markScrollEnd)
-addEventListener('resize', markScrollEnd)
 
 // This button does a fetch from the remotes, and then reads the status again.
 // The periodic refresh does not do the fetch.

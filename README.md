@@ -252,6 +252,9 @@ step that names a condition, for example `dev dirty`, waits for you to remove
 it. Two steps can wait at the same time, so the number gives the order and not
 a position in a queue.
 
+**Incoming from upstream** under step 2 lists the commits that step would
+bring in.
+
 Each worktree row has two more controls. The pencil commits each change in that
 worktree. The arrow pushes its branch. Each one shows only while it applies.
 The deploy worktree has neither, because it holds the release.

@@ -2530,6 +2530,11 @@ const PAGE = String.raw`<!doctype html>
   div.step.serving .glyph::before { content:'●'; color:var(--green); }
   .step .glyph { flex:none; width:1rem; text-align:center; color:var(--faint); }
   .step .glyph::before { content:'○'; }
+  /* The integration list is an order, and not a progress bar: two of its steps
+     can wait at the same time. Thus the glyph gives the position, and the
+     brightness of the row gives what you can do now. */
+  .steps.flow .step .glyph::before { content:attr(data-step); font-size:.7rem; }
+  .steps.flow button.step:not(:disabled) .glyph::before { color:var(--accent); }
   .step.complete .glyph::before { content:'✓'; color:var(--green); }
   .step.current { color:var(--text); background:rgba(125,211,252,.04); }
   .step.current .glyph::before { content:'●'; color:var(--accent); }
@@ -2883,21 +2888,25 @@ const PAGE = String.raw`<!doctype html>
               <button class="icon wt-push" id="dev-push" title="Push this branch to the fork">⇧</button>
             </div>
           </div>
+          <!-- The order of the integration, from the top down. The number is
+               the position in that order, and the label reads from the source
+               to the target. Thus the row says what it moves, and where. A
+               step with nothing to move is dim. -->
+          <div class="steps flow" aria-label="Integration order">
+            <button class="step" id="job-pull-dev"><span class="glyph" data-step="1"></span>
+              <span class="lbl">origin &rarr; dev</span><span class="meta" id="meta-pull-dev"></span></button>
+            <button class="step" id="job-main"><span class="glyph" data-step="2"></span>
+              <span class="lbl">upstream &rarr; main</span><span class="meta" id="meta-main"></span></button>
+            <button class="step" id="job-merge-main-dev"><span class="glyph" data-step="3"></span>
+              <span class="lbl">main &rarr; dev</span><span class="meta" id="meta-merge-main-dev"></span></button>
+            <button class="step" id="fork-promote"><span class="glyph" data-step="4"></span>
+              <span class="lbl">dev &rarr; deploy</span><span class="meta" id="meta-promote"></span></button>
+          </div>
           <!-- One row per feature worktree: click the branch to serve it on
-               the dev tab; the icons merge it into dev or promote it into
-               deploy. Dev itself stays the staging pipeline below. -->
+               the dev tab; the icons commit, push, merge it into dev, or
+               promote it into deploy. -->
           <div class="steps" id="wt-list" hidden aria-label="Feature worktrees"></div>
           <button class="foldout" id="wt-new" style="margin-top:.4rem">+ new worktree</button>
-          <div class="steps" aria-label="Integration actions">
-            <button class="step" id="job-pull-dev"><span class="glyph"></span>
-              <span class="lbl">dev &larr; origin</span><span class="meta" id="meta-pull-dev"></span></button>
-            <button class="step" id="job-main"><span class="glyph"></span>
-              <span class="lbl">main &larr; upstream</span><span class="meta" id="meta-main"></span></button>
-            <button class="step" id="job-merge-main-dev"><span class="glyph"></span>
-              <span class="lbl">dev &larr; main</span><span class="meta" id="meta-merge-main-dev"></span></button>
-            <button class="step" id="fork-promote"><span class="glyph"></span>
-              <span class="lbl">deploy &larr; dev</span><span class="meta" id="meta-promote"></span></button>
-          </div>
           <div id="fork-dev-note" class="note"></div>
           <div id="dev-runner-note" class="note"></div>
         </div>
@@ -3050,6 +3059,20 @@ const PAGE = String.raw`<!doctype html>
 <script>
 const TOKEN = '__TOKEN__'
 const $ = (id) => document.getElementById(id)
+
+// Every write carries the token of the process that served this page. A
+// restart makes a new token, so a page that was open across one holds a token
+// that the dashboard now refuses. Reload, because a reload is the whole fix.
+// Without this, each button on that page reports "bad token" until you reload
+// by hand.
+async function post(url) {
+  const res = await fetch(url, { method: 'POST', headers: { 'x-token': TOKEN } })
+  if (res.status === 403) {
+    location.reload()
+    throw new Error('the dashboard restarted; reloading this page')
+  }
+  return res
+}
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
 // The sidebar carries the newest line; the whole of it lives in the modal.
 let logText = 'ready'
@@ -3189,7 +3212,7 @@ async function pairFrame() {
   showPlaceholder('pairing this browser…', 'Creating a short-lived link and completing it in place.', false)
   try {
     const params = new URLSearchParams({ label: 'dashboard embed', ttl: '15m' })
-    const res = await fetch('/_dash/pair?' + params, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await post('/_dash/pair?' + params)
     const result = await res.json()
     if (!res.ok) throw new Error(result.error ?? 'pairing failed')
 
@@ -3300,9 +3323,7 @@ $('settings-dev-mode').onchange = async (e) => {
   const wanted = e.target.checked
   e.target.disabled = true
   try {
-    const res = await fetch('/_dash/settings?devMode=' + (wanted ? '1' : '0'), {
-      method: 'POST', headers: { 'x-token': TOKEN },
-    })
+    const res = await post('/_dash/settings?devMode=' + (wanted ? '1' : '0'))
     const s = await res.json()
     if (!res.ok) throw new Error(s.error ?? 'could not save the setting')
     setDevMode(Boolean(s.devMode))
@@ -3353,7 +3374,7 @@ async function act(name, btn) {
   const label = btn.textContent
   btn.textContent = '…'
   try {
-    const res = await fetch('/_dash/action?name=' + name, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await post('/_dash/action?name=' + name)
     log(await res.json())
   } catch (err) {
     log('failed: ' + err.message)
@@ -3522,15 +3543,18 @@ function renderFork(f) {
     f.remoteDeployAhead > 0 ? 'local commits'
       : f.remoteDeployBehind > 0 ? f.remoteDeployBehind + ' new' : 'current',
     f.remoteDeployAhead > 0)
+  // One vocabulary across the whole list: the count of what waits, or
+  // "current" for a step with nothing to move. A condition that blocks the
+  // step takes the place of both, because it is what you must act on.
   setStepMeta('meta-pull-dev',
     f.dev.dirty ? 'dev dirty'
       : (f.dev.behindOrigin ?? 0) > 0 ? f.dev.behindOrigin + ' new' : 'current',
     f.dev.dirty)
-  setStepMeta('meta-main', f.mainBehind > 0 ? f.mainBehind + ' upstream' : 'synced')
+  setStepMeta('meta-main', f.mainBehind > 0 ? f.mainBehind + ' new' : 'current')
   setStepMeta('meta-merge-main-dev',
     !f.clean ? 'conflicts'
       : f.dev.dirty ? 'dev dirty'
-      : f.devBehindMain > 0 ? f.devBehindMain + ' to merge' : 'merged',
+      : f.devBehindMain > 0 ? f.devBehindMain + ' new' : 'current',
     !f.clean || f.dev.dirty)
   setStepMeta('meta-build',
     f.dirty ? 'worktree dirty'
@@ -3543,7 +3567,7 @@ function renderFork(f) {
   setStepMeta('meta-promote',
     !f.dev.clean ? 'conflicts'
       : f.dev.dirty ? 'dev dirty'
-      : f.dev.ahead > 0 ? f.dev.ahead + ' to promote' : 'nothing new',
+      : f.dev.ahead > 0 ? f.dev.ahead + ' new' : 'current',
     !f.dev.clean || f.dev.dirty)
 
   // The pipeline rows already say what is pending; the note speaks only when
@@ -3607,7 +3631,7 @@ $('fork-refresh').onclick = async (e) => {
   btn.disabled = true
   btn.setAttribute('data-spin', '')
   try {
-    const res = await fetch('/_dash/fork/refresh', { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await post('/_dash/fork/refresh')
     const f = await res.json()
     if (!res.ok) throw new Error(f.error ?? 'refresh failed')
     renderFork(f)
@@ -3724,7 +3748,7 @@ $('self-refresh').onclick = async (e) => {
   btn.disabled = true
   btn.setAttribute('data-spin', '')
   try {
-    const res = await fetch('/_dash/self/refresh', { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await post('/_dash/self/refresh')
     const s = await res.json()
     if (!res.ok) throw new Error(s.error ?? 'refresh failed')
     renderSelf(s)
@@ -3769,7 +3793,7 @@ async function startJobWith(name, extra = {}) {
   for (const id of JOB_BUTTONS) $(id).disabled = true
   try {
     const params = new URLSearchParams({ name, ...extra })
-    const res = await fetch('/_dash/job?' + params, { method: 'POST', headers: { 'x-token': TOKEN } })
+    const res = await post('/_dash/job?' + params)
     const r = await res.json()
     if (!res.ok) throw new Error(r.error ?? 'could not start')
     pollJob(r.id)
@@ -3802,15 +3826,15 @@ function confirmAction(title, message) {
 // text is the button's tooltip, so you can read what a step does before you
 // click it.
 const JOB_UI = [
-  ['job-pull-deploy', 'pull-deploy', 'deploy ← origin/deploy',
+  ['job-pull-deploy', 'pull-deploy', 'origin/deploy → deploy',
     'Pull the latest deploy branch. This builds nothing and restarts nothing.'],
-  ['job-pull-dev', 'pull-dev', 'dev ← origin/dev',
+  ['job-pull-dev', 'pull-dev', 'origin/dev → dev',
     'Pull the latest dev branch. This builds nothing and restarts nothing.'],
-  ['job-main', 'main', 'main ← upstream',
+  ['job-main', 'main', 'upstream/main → main',
     'Move main to upstream/main, and push main. No other branch changes.'],
-  ['job-merge-main-dev', 'merge-main-dev', 'dev ← main',
+  ['job-merge-main-dev', 'merge-main-dev', 'main → dev',
     'Merge main into dev, and push dev. This builds nothing and restarts nothing.'],
-  ['fork-promote', 'promote', 'deploy ← dev',
+  ['fork-promote', 'promote', 'dev → deploy',
     'Merge dev into deploy, and push deploy. This builds nothing and restarts nothing.'],
   ['build-run', 'build', 'build',
     'Build the current branch from the source. This changes no branch, and the running service stays as it is.'],
@@ -3975,7 +3999,7 @@ $('wt-list').onclick = async (e) => {
   if (serve && !serve.disabled) return serveWorktree(serve.dataset.path, serve.dataset.branch)
   if (merge && !merge.disabled) {
     const branch = merge.dataset.branch
-    if (await confirmAction('dev ← ' + branch,
+    if (await confirmAction(branch + ' → dev',
       'Merge ' + branch + ' into dev, and push dev. This builds nothing and restarts nothing.')) {
       startJob('merge-into-dev', branch)
     }
@@ -3983,7 +4007,7 @@ $('wt-list').onclick = async (e) => {
   }
   if (promote && !promote.disabled) {
     const branch = promote.dataset.branch
-    if (await confirmAction('deploy ← ' + branch,
+    if (await confirmAction(branch + ' → deploy',
       'Merge ' + branch + ' into deploy, and push deploy. This builds nothing and restarts nothing.')) {
       startJob('promote-branch', branch)
     }
@@ -4127,9 +4151,7 @@ async function refreshDevRunner() {
 async function runnerAction(action, worktree) {
   const params = new URLSearchParams({ action })
   if (worktree) params.set('worktree', worktree)
-  const res = await fetch('/_dash/dev-runner?' + params, {
-    method: 'POST', headers: { 'x-token': TOKEN },
-  })
+  const res = await post('/_dash/dev-runner?' + params)
   const r = await res.json()
   if (!res.ok) throw new Error(r.error ?? 'could not ' + action)
   renderDevRunner(r)
@@ -4171,9 +4193,7 @@ async function initMock() {
     sel.innerHTML = r.scenarios.map((s) =>
       '<option' + (s === r.scenario ? ' selected' : '') + '>' + esc(s) + '</option>').join('')
     sel.onchange = async () => {
-      await fetch('/_dash/mock?scenario=' + encodeURIComponent(sel.value), {
-        method: 'POST', headers: { 'x-token': TOKEN },
-      })
+      await post('/_dash/mock?scenario=' + encodeURIComponent(sel.value))
       log('mock scenario: ' + sel.value)
       refresh(); refreshFork(); refreshDevRunner(); checkUpdates()
     }

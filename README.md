@@ -229,23 +229,32 @@ section moves `main`, `dev`, and `deploy`. Each button moves one branch.
 
 Each button moves one thing. The arrow gives the direction.
 
+The release section has the three steps of a release, in order:
+
 ```text
-RELEASE  Pull deploy       pulls the shared deploy branch. It does not push.
-RELEASE  Build             compiles the source. No install. No restart.
-RELEASE  Deploy            installs the build and restarts T3 Code. No compile.
-DEV      commit  (pencil)  commits each change in one worktree. It does not push.
-DEV      push    (arrow)   pushes the branch of one worktree. It merges nothing.
-DEV      dev <- origin     pulls the shared dev branch. It does not push.
-DEV      main <- upstream  moves main only. It pushes main.
-DEV      dev <- main       merges main into dev. It pushes dev.
-DEV      deploy <- dev     promotes dev to deploy. It pushes deploy.
+1  Pull deploy       pulls the shared deploy branch. It does not push.
+2  Build             compiles the source. No install. No restart.
+3  Deploy            installs the build and restarts T3 Code. No compile.
 ```
 
-The commit and push controls belong to a worktree that you work in. They are on
-the row of the development worktree, and on the row of each feature worktree.
-Each control shows only while it applies: the pencil while the worktree has
-changes, and the arrow while the branch has commits that the fork does not
-have. The deploy worktree takes no commit, because it holds the release.
+The dev section has the integration, in order. The label reads from the source
+to the target:
+
+```text
+1  origin -> dev       pulls the shared dev branch. It does not push.
+2  upstream -> main    moves main only. It pushes main.
+3  main -> dev         merges main into dev. It pushes dev.
+4  dev -> deploy       promotes dev to deploy. It pushes deploy.
+```
+
+Do the step that has a count. A step with `current` has nothing to move, and a
+step that names a condition, for example `dev dirty`, waits for you to remove
+it. Two steps can wait at the same time, so the number gives the order and not
+a position in a queue.
+
+Each worktree row has two more controls. The pencil commits each change in that
+worktree. The arrow pushes its branch. Each one shows only while it applies.
+The deploy worktree has neither, because it holds the release.
 
 No button builds and merges together. No button merges two pairs of branches
 together.

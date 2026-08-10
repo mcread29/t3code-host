@@ -1606,11 +1606,13 @@ function worktreeRemoveSteps(path) {
   if (!path || samePath(path, REPO) || samePath(path, DEV_REPO)) {
     throw new Error('only feature worktrees can be removed')
   }
+  let branch = null
   return [
     step('verify the worktree', async (job) => {
       const known = (await listWorktrees()).find((w) => samePath(w.path, path))
       if (!known) throw new Error(`not a worktree of the fork: ${path}`)
       if (samePath(devRunner.worktree, path)) throw new Error('the dev server is serving this worktree; stop it first')
+      branch = known.branch
       appendOutput(job, `${known.branch} at ${path}\n`)
     }),
     step('remove the project from the deploy console', async (job) => {
@@ -1622,7 +1624,9 @@ function worktreeRemoveSteps(path) {
       }
     }),
     step('remove the worktree', (job) =>
-      exec(job, 'git', ['-C', REPO, 'worktree', 'remove', path])),
+      exec(job, 'git', ['-C', REPO, 'worktree', 'remove', '--force', path])),
+    step('delete the branch', (job) =>
+      exec(job, 'git', ['-C', REPO, 'branch', '--delete', '--force', branch])),
   ]
 }
 
@@ -1960,7 +1964,7 @@ function startMockJob(name, branch) {
       : name === 'worktree-create'
         ? ['check the branch is free', 'fetch', 'create the worktree', 'add it as a project']
         : name === 'worktree-remove'
-          ? ['verify the worktree', 'remove the project', 'remove the worktree']
+          ? ['verify the worktree', 'remove the project', 'remove the worktree', 'delete the branch']
           : name === 'commit'
             ? ['verify the worktree', 'stage each change', 'commit']
             : name === 'push'
@@ -3872,13 +3876,9 @@ function renderWorktrees() {
       (forkBusy || w.inDev || !w.clean ? ' disabled' : '') + '>⇣</button>' +
       '<button class="icon wt-promote" data-branch="' + esc(w.branch) + '" title="Promote into deploy"' +
       (forkBusy || w.aheadDeploy === 0 ? ' disabled' : '') + '>⇡</button>' +
-      // Git refuses to remove a worktree that has uncommitted changes. Thus
-      // the control goes away until you commit them, and the row keeps the
-      // width for the controls that do work.
-      (w.dirty ? ''
-        : '<button class="icon danger wt-remove" data-path="' + esc(w.path) + '" data-branch="' +
-          esc(w.branch) + '" title="Remove the worktree and its project"' +
-          (forkBusy || serving ? ' disabled' : '') + '>✕</button>') +
+      '<button class="icon danger wt-remove" data-path="' + esc(w.path) + '" data-branch="' +
+        esc(w.branch) + '" title="Remove the worktree and its branch"' +
+        (forkBusy || serving ? ' disabled' : '') + '>✕</button>' +
       '</div>'
   }).join('')
 }
@@ -3961,7 +3961,7 @@ $('wt-list').onclick = async (e) => {
   if (remove && !remove.disabled) {
     const branch = remove.dataset.branch
     if (await confirmAction('remove ' + branch,
-      'Remove this worktree and its project in the deploy console. The branch itself is kept, so nothing committed is lost.')) {
+      'Remove this worktree and its project. Delete its branch. This discards each uncommitted change.')) {
       startJobWith('worktree-remove', { path: remove.dataset.path })
     }
   }

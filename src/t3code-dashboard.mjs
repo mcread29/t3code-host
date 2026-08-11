@@ -1488,25 +1488,31 @@ const SELF_UPDATE_STEPS = [
     if (linked) appendOutput(job, `${SELF_TARGET} is a link to the source; the restart applies it.\n`)
 
     if (SCHEDULED_TASK) {
-      // The task holds the file open. Thus the copy waits for the stop, and
-      // the start waits for the copy.
+      // Ending the dashboard task also ends each process that the task owns.
+      // Thus a second scheduled task must own the refresh before the stop.
+      const refreshTask = `${DASH_UNIT}-refresh`
+      const quote = (value) => `'${String(value).replaceAll("'", "''")}'`
       const copy = linked ? '' :
-        `Copy-Item -LiteralPath '${SELF_SOURCE}' -Destination '${SELF_TARGET}' -Force; `
+        `Copy-Item -LiteralPath ${quote(SELF_SOURCE)} -Destination ${quote(SELF_TARGET)} -Force; `
       const command =
-        `schtasks.exe /End /TN '${DASH_UNIT}' | Out-Null; Start-Sleep -Seconds 2; ` +
+        `schtasks.exe /End /TN ${quote(DASH_UNIT)} | Out-Null; Start-Sleep -Seconds 2; ` +
         copy +
-        `schtasks.exe /Run /TN '${DASH_UNIT}' | Out-Null`
-      await new Promise((resolveLaunch, rejectLaunch) => {
-        const child = spawn(POWERSHELL_BIN, [
-          '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command,
-        ], { cwd: USER_HOME || undefined, detached: true, stdio: 'ignore', windowsHide: true })
-        child.once('error', rejectLaunch)
-        child.once('spawn', () => {
-          child.unref()
-          resolveLaunch()
-        })
-      })
-      appendOutput(job, 'PowerShell owns the refresh. The dashboard restarts in a moment.\n')
+        `schtasks.exe /Run /TN ${quote(DASH_UNIT)} | Out-Null; ` +
+        `schtasks.exe /Delete /TN ${quote(refreshTask)} /F | Out-Null`
+      const encoded = Buffer.from(command, 'utf16le').toString('base64')
+      const separator = refreshTask.replaceAll('/', '\\').lastIndexOf('\\')
+      const taskPath = separator >= 0 ? refreshTask.slice(0, separator + 1) : '\\'
+      const taskName = separator >= 0 ? refreshTask.slice(separator + 1) : refreshTask
+      const argumentsText = `-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encoded}`
+      const register =
+        `$action = New-ScheduledTaskAction -Execute ${quote(POWERSHELL_BIN)} -Argument ${quote(argumentsText)}; ` +
+        `Register-ScheduledTask -TaskPath ${quote(taskPath)} -TaskName ${quote(taskName)} ` +
+        `-Action $action -Description 'Refreshes the T3 Code dashboard.' -Force | Out-Null`
+      await exec(job, POWERSHELL_BIN, [
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', register,
+      ], { cwd: USER_HOME || undefined })
+      await exec(job, 'schtasks.exe', ['/Run', '/TN', refreshTask], { cwd: USER_HOME || undefined })
+      appendOutput(job, 'A Windows task owns the refresh. The dashboard restarts in a moment.\n')
       return
     }
 

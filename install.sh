@@ -318,9 +318,11 @@ else
   t3_bin="$(command -v t3)"
 fi
 
-if [ "$instance" = production ]; then
+if [ "$instance" = production ] && [ "$skip_build" != 1 ] && [ "${build_current:-0}" != 1 ]; then
   echo "Replacing T3 Code's native service with the Tailnet-bound service..."
   "$t3_bin" service uninstall 2>/dev/null || true
+elif [ "$instance" = production ]; then
+  echo "T3 Code is unchanged; keeping its service active."
 else
   echo "Installing isolated $instance services; the production service will not be changed."
 fi

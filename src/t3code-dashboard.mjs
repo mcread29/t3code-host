@@ -1432,6 +1432,16 @@ const PROMOTE_STEPS = [
   step(`push ${BRANCH}`, (job) => exec(job, 'git', ['-C', REPO, 'push', 'origin', BRANCH])),
 ]
 
+// A developer update pulls upstream, moves the changes through dev and deploy,
+// and builds the result. Deploy stays separate, so a failed build changes no
+// running service.
+const PULL_BUILD_STEPS = [
+  ...MAIN_STEPS,
+  ...MERGE_MAIN_DEV_STEPS,
+  ...PROMOTE_STEPS,
+  ...BUILD_STEPS,
+]
+
 // The source of this dashboard, and the file that the service runs. The
 // running file is a copy, so an update replaces the copy.
 const SELF_SOURCE = HOST_REPO ? join(HOST_REPO, 'src', 't3code-dashboard.mjs') : ''
@@ -1534,6 +1544,7 @@ const SELF_UPDATE_STEPS = [
 // One job moves one thing. Thus you always know what a button changes, and a
 // failure gives you one step to repeat.
 //
+//   pull-build     upstream -> dev -> deploy -> build. No install. No restart.
 //   pull-deploy    deploy <- origin/deploy. No build. No restart.
 //   pull-dev       dev <- origin/dev. No build. No restart.
 //   main           main <- upstream/main. No merge into another branch.
@@ -1545,6 +1556,7 @@ const SELF_UPDATE_STEPS = [
 // A release update is pull-deploy, build, deploy. The integration jobs stay
 // separate. Thus one machine can update the shared deploy branch.
 const JOBS = {
+  'pull-build': [...PULL_BUILD_STEPS],
   'pull-deploy': [...PULL_DEPLOY_STEPS],
   'pull-dev': [...PULL_DEV_STEPS],
   main: [...MAIN_STEPS],
@@ -1747,7 +1759,7 @@ function parameterizedSteps(name, params) {
 // The jobs that move `main`, `dev`, or a feature branch. They belong to the
 // integration machine. Thus developer mode must be on to start one.
 const DEV_MODE_JOBS = new Set([
-  'pull-dev', 'main', 'merge-main-dev', 'promote',
+  'pull-build', 'pull-dev', 'main', 'merge-main-dev', 'promote',
   'merge-into-dev', 'promote-branch', 'worktree-create', 'worktree-remove',
   'commit', 'push',
 ])
@@ -2819,6 +2831,8 @@ const PAGE = String.raw`<!doctype html>
              step. The glyph gives the position in the flow, the meta gives
              what the step would act on, and the row itself is the action. -->
         <div class="steps" aria-label="Release pipeline">
+          <button class="step" id="job-pull-build" hidden><span class="glyph"></span>
+            <span class="lbl">Pull upstream + build</span><span class="meta" id="meta-pull-build"></span></button>
           <button class="step" id="job-pull-deploy"><span class="glyph"></span>
             <span class="lbl">Pull deploy</span><span class="meta" id="meta-pull-deploy"></span></button>
           <button class="step" id="build-run"><span class="glyph"></span>
@@ -3474,6 +3488,7 @@ function renderFork(f) {
   // restarts the service, so it needs the service but no clean worktree.
   const busy = Boolean(f.active)
   const hasDev = Boolean(f.dev.repo && f.dev.repo !== f.repo)
+  const devPullBuild = f.devMode === true
   $('dev-empty').hidden = hasDev
   $('dev-content').hidden = !hasDev
   // The path answers "where do I go to work on this"; the ahead/behind counts
@@ -3483,6 +3498,9 @@ function renderFork(f) {
   lastWorktrees = f.worktrees ?? []
   forkBusy = busy
   renderWorktrees()
+  $('job-pull-build').hidden = !devPullBuild
+  $('job-pull-deploy').hidden = devPullBuild
+  $('build-run').hidden = devPullBuild
   $('job-pull-deploy').disabled = busy || f.dirty || f.remoteDeployBehind === 0 || f.remoteDeployAhead > 0
   $('job-pull-dev').disabled = busy || f.dev.dirty || (f.dev.behindOrigin ?? 0) === 0
   $('job-main').disabled = busy || f.mainBehind === 0
@@ -3490,12 +3508,19 @@ function renderFork(f) {
   $('fork-promote').disabled = busy || f.dirty || f.dev.dirty || !f.dev.clean || f.dev.ahead === 0
   $('build-run').disabled = busy || !managed || f.dirty || !f.needsRebuild || pending
   $('build-deploy').disabled = busy || !managed || !f.needsDeploy || f.needsRebuild || pending
+  const canPullBuild = devPullBuild && hasDev && !f.dirty && !f.dev.dirty && f.clean &&
+    (f.mainBehind > 0 || f.devBehindMain > 0 || f.dev.ahead > 0 || f.needsRebuild)
+  $('job-pull-build').disabled = busy || !managed || !canPullBuild
 
-  const flow = ['job-pull-deploy', 'build-run', 'build-deploy']
-  const currentStep = f.remoteDeployBehind > 0 ? 0
-    : f.needsRebuild ? 1
-      : f.needsDeploy ? 2
-          : flow.length
+  const flow = devPullBuild
+    ? ['job-pull-build', 'build-deploy']
+    : ['job-pull-deploy', 'build-run', 'build-deploy']
+  const currentStep = devPullBuild
+    ? (canPullBuild ? 0 : f.needsDeploy ? 1 : flow.length)
+    : (f.remoteDeployBehind > 0 ? 0
+      : f.needsRebuild ? 1
+        : f.needsDeploy ? 2
+            : flow.length)
   for (const [index, id] of flow.entries()) {
     const button = $(id)
     button.classList.toggle('current', index === currentStep)
@@ -3508,6 +3533,13 @@ function renderFork(f) {
     f.remoteDeployAhead > 0 ? 'local commits'
       : f.remoteDeployBehind > 0 ? f.remoteDeployBehind + ' new' : 'current',
     f.remoteDeployAhead > 0)
+  setStepMeta('meta-pull-build',
+    f.dirty ? 'deploy dirty'
+      : f.dev.dirty ? 'dev dirty'
+      : !hasDev ? 'no dev worktree'
+      : !f.clean ? 'conflicts'
+      : canPullBuild ? 'ready' : 'current',
+    f.dirty || f.dev.dirty || !f.clean)
   // One vocabulary across the whole list: the count of what waits, or
   // "current" for a step with nothing to move. A condition that blocks the
   // step takes the place of both, because it is what you must act on.
@@ -3731,7 +3763,7 @@ async function waitForRestart() {
 // Every job button, so a running job disables all of them and the page cannot
 // start a second job on the same repository.
 const JOB_BUTTONS = [
-  'job-pull-deploy', 'job-pull-dev', 'job-main', 'job-merge-main-dev', 'fork-promote',
+  'job-pull-build', 'job-pull-deploy', 'job-pull-dev', 'job-main', 'job-merge-main-dev', 'fork-promote',
   'build-run', 'build-deploy', 'job-self-update',
 ]
 
@@ -3774,6 +3806,8 @@ function confirmAction(title, message) {
 // text is the button's tooltip, so you can read what a step does before you
 // click it.
 const JOB_UI = [
+  ['job-pull-build', 'pull-build', 'pull upstream + build',
+    'Pull upstream, integrate it into dev and deploy, and build it. The action stops at the first failure. It does not install or restart T3 Code.'],
   ['job-pull-deploy', 'pull-deploy', 'origin/deploy → deploy',
     'Pull the latest deploy branch. This builds nothing and restarts nothing.'],
   ['job-pull-dev', 'pull-dev', 'origin/dev → dev',

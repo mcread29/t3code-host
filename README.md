@@ -237,8 +237,11 @@ The release section has the three steps of a release, in order:
 3  Deploy            installs the build and restarts T3 Code. No compile.
 ```
 
-The dev section has the integration, in order. The label reads from the source
-to the target:
+The dev section has the integration controls. Developer mode also has one
+button that pulls upstream, moves the result through dev and deploy, and builds
+it. The button stops at the first failed step. Deploy remains separate.
+
+The individual integration labels read from the source to the target:
 
 ```text
 1  origin -> dev       pulls the shared dev branch. It does not push.
@@ -259,8 +262,8 @@ Each worktree row has two more controls. The pencil commits each change in that
 worktree. The arrow pushes its branch. Each one shows only while it applies.
 The deploy worktree has neither, because it holds the release.
 
-No button builds and merges together. No button merges two pairs of branches
-together.
+The combined developer button does not install the build or restart T3 Code.
+Use **Deploy** after a successful build.
 
 A machine updates its release with these steps:
 
